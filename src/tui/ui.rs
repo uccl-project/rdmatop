@@ -1,23 +1,31 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState,
+    },
     Frame,
 };
 
-use super::app::{App, CounterRate, PortThroughput};
+use super::app::{
+    all_columns, App, CounterRate, PortThroughput, TableColumn, BAR_WIDTH, EXTRA_COUNTERS,
+};
 use super::theme::ThemeColors;
 
 const HELP_KEYS: &[(&str, &str)] = &[
     ("↑ / k", "Move up"),
     ("↓ / j", "Move down"),
+    ("← / →", "Scroll columns"),
     ("Enter", "Toggle detail panel"),
     ("Esc", "Close detail / quit"),
     ("t", "Cycle theme"),
     ("a", "Toggle rolling average"),
-    ("+ / =", "Increase avg window (+5s)"),
-    ("-", "Decrease avg window (-5s)"),
+    ("+ / =", "Increase avg window (+1s)"),
+    ("-", "Decrease avg window (-1s)"),
+    ("w", "Set avg window (custom)"),
+    ("c", "Configure columns"),
     ("h", "Toggle this help"),
     ("q", "Quit"),
     ("", ""),
@@ -29,7 +37,6 @@ const HELP_KEYS: &[(&str, &str)] = &[
 ];
 
 const RDMA_LINK_GBPS: f64 = 100.0;
-const BAR_WIDTH: usize = 12;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let tc = app.theme.colors();
@@ -56,6 +63,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         draw_help_popup(frame, &tc);
+    }
+    if app.show_window_input {
+        draw_window_input_popup(frame, app, &tc);
+    }
+    if app.show_column_picker {
+        draw_column_picker(frame, app, &tc);
     }
 }
 
@@ -208,65 +221,134 @@ fn gbps_bar(gbps: f64) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(BAR_WIDTH - filled))
 }
 
-fn throughput_to_row(t: &PortThroughput, tc: &ThemeColors) -> Row<'static> {
-    let tx_c = gbps_color(t.tx_gbps, tc);
-    let rx_c = gbps_color(t.rx_gbps, tc);
-    let drop_c = if t.rx_drops_per_sec > 0.0 {
-        tc.error
-    } else {
-        tc.muted
-    };
-
-    Row::new(vec![
-        Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
-        Cell::from(t.port.to_string()).style(Style::default().fg(tc.muted)),
-        Cell::from(gbps_bar(t.tx_gbps)).style(Style::default().fg(tx_c)),
-        Cell::from(format!("{:.2}", t.tx_gbps)).style(Style::default().fg(tx_c)),
-        Cell::from(gbps_bar(t.rx_gbps)).style(Style::default().fg(rx_c)),
-        Cell::from(format!("{:.2}", t.rx_gbps)).style(Style::default().fg(rx_c)),
-        Cell::from(format_pps(t.tx_pkts_per_sec)).style(Style::default().fg(tc.fg)),
-        Cell::from(format_pps(t.rx_pkts_per_sec)).style(Style::default().fg(tc.fg)),
-        Cell::from(format!("{:.0}", t.rx_drops_per_sec)).style(Style::default().fg(drop_c)),
-    ])
+fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
+    match col {
+        TableColumn::Device => Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
+        TableColumn::Port => Cell::from(t.port.to_string()).style(Style::default().fg(tc.muted)),
+        TableColumn::TxBar => {
+            Cell::from(gbps_bar(t.tx_gbps)).style(Style::default().fg(gbps_color(t.tx_gbps, tc)))
+        }
+        TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
+            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
+        TableColumn::RxBar => {
+            Cell::from(gbps_bar(t.rx_gbps)).style(Style::default().fg(gbps_color(t.rx_gbps, tc)))
+        }
+        TableColumn::RxGbps => Cell::from(format!("{:.2}", t.rx_gbps))
+            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+        TableColumn::TxPps => {
+            Cell::from(format_pps(t.tx_pkts_per_sec)).style(Style::default().fg(tc.fg))
+        }
+        TableColumn::RxPps => {
+            Cell::from(format_pps(t.rx_pkts_per_sec)).style(Style::default().fg(tc.fg))
+        }
+        TableColumn::Drops => {
+            let c = if t.rx_drops_per_sec > 0.0 {
+                tc.error
+            } else {
+                tc.muted
+            };
+            Cell::from(format!("{:.0}", t.rx_drops_per_sec)).style(Style::default().fg(c))
+        }
+        TableColumn::Counter(name) => {
+            let rate = t
+                .counter_rates
+                .iter()
+                .find(|r| &r.name == name)
+                .map(|r| r.rate)
+                .unwrap_or(0.0);
+            let is_bytes = t
+                .counter_rates
+                .iter()
+                .find(|r| &r.name == name)
+                .map(|r| r.is_bytes)
+                .unwrap_or(false);
+            let text = if is_bytes {
+                format_bytes(rate)
+            } else {
+                format_rate(rate)
+            };
+            let color = if rate > 0.0 { tc.fg } else { tc.muted };
+            Cell::from(text).style(Style::default().fg(color))
+        }
+    }
 }
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let display = app.display_throughputs();
     let title = if app.show_rolling_avg {
-        format!(
-            " RDMA Throughput (avg {}s) ",
-            app.rolling_avg.window_secs
-        )
+        format!(" RDMA Throughput (avg {}s) ", app.rolling_avg.window_secs)
     } else {
         " RDMA Throughput ".to_string()
     };
 
-    let header = Row::new([
-        "Device", "Port", "TX ▏", "TX Gbps", "RX ▏", "RX Gbps", "TX pps", "RX pps", "Drops/s",
-    ])
-    .style(
-        Style::default()
-            .fg(tc.header_fg)
-            .add_modifier(Modifier::BOLD),
-    )
-    .height(1);
+    // In detail mode, use default columns with no scrolling (original behavior).
+    // In normal mode, use configured columns with horizontal scroll.
+    let default_cols = super::app::default_columns();
+    let (cols_to_render, show_scrollbars) = if app.show_detail {
+        (default_cols.iter().collect::<Vec<_>>(), false)
+    } else {
+        let all_cols = &app.columns;
+        let avail = area.width.saturating_sub(4) as usize;
+
+        let visible: Vec<&super::app::TableColumn> = all_cols
+            .iter()
+            .skip(app.h_scroll)
+            .scan(0usize, |used, col| {
+                let w = col.width() as usize + 1;
+                if *used + col.width() as usize <= avail {
+                    *used += w;
+                    Some(col)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Compute max horizontal scroll
+        let mut max_offset = 0;
+        for start in 0..all_cols.len() {
+            let total_w: usize = all_cols[start..]
+                .iter()
+                .map(|c| c.width() as usize + 1)
+                .sum();
+            if total_w > avail {
+                max_offset = start + 1;
+            } else {
+                break;
+            }
+        }
+        app.h_scroll_max = max_offset;
+        if app.h_scroll > app.h_scroll_max {
+            app.h_scroll = app.h_scroll_max;
+        }
+
+        (visible, true)
+    };
+
+    let header = Row::new(cols_to_render.iter().map(|c| c.label()).collect::<Vec<_>>())
+        .style(
+            Style::default()
+                .fg(tc.header_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
 
     let rows: Vec<Row> = display
         .iter()
-        .map(|t| throughput_to_row(t, tc))
+        .map(|t| {
+            Row::new(
+                cols_to_render
+                    .iter()
+                    .map(|c| column_cell(c, t, tc))
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
 
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(6),
-        Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(9),
-        Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(9),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(9),
-    ];
+    let widths: Vec<Constraint> = cols_to_render
+        .iter()
+        .map(|c| Constraint::Length(c.width()))
+        .collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -289,27 +371,50 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         state.select(Some(app.selected_row));
     }
     frame.render_stateful_widget(table, area, &mut state);
-}
 
-const DETAIL_COUNTERS: &[&str] = &[
-    "send_bytes",
-    "send_wrs",
-    "recv_bytes",
-    "recv_wrs",
-    "rdma_write_bytes",
-    "rdma_write_wrs",
-    "rdma_write_wr_err",
-    "rdma_write_recv_bytes",
-    "rdma_read_bytes",
-    "rdma_read_wrs",
-    "rdma_read_wr_err",
-    "rdma_read_resp_bytes",
-    "retrans_bytes",
-    "retrans_pkts",
-    "retrans_timeout_events",
-    "unresponsive_remote_events",
-    "impaired_remote_conn_events",
-];
+    if !show_scrollbars {
+        return;
+    }
+
+    // Vertical scrollbar (right side, inside border)
+    if display.len() > area.height.saturating_sub(4) as usize {
+        let mut v_scroll = ScrollbarState::new(display.len()).position(app.selected_row);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("▐")
+                .track_symbol(Some("│"))
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_style(Style::default().fg(tc.accent))
+                .track_style(Style::default().fg(tc.border)),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut v_scroll,
+        );
+    }
+
+    // Horizontal scrollbar (bottom, inside border)
+    let all_cols = &app.columns;
+    if all_cols.len() > cols_to_render.len() || app.h_scroll > 0 {
+        let mut h_scroll = ScrollbarState::new(all_cols.len()).position(app.h_scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .thumb_symbol("▬")
+                .track_symbol(Some("─"))
+                .begin_symbol(Some("◀"))
+                .end_symbol(Some("▶"))
+                .thumb_style(Style::default().fg(tc.accent))
+                .track_style(Style::default().fg(tc.border)),
+            area.inner(Margin {
+                vertical: 0,
+                horizontal: 1,
+            }),
+            &mut h_scroll,
+        );
+    }
+}
 
 fn sparkline_str(data: &[f64], width: usize) -> String {
     const BARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -382,7 +487,7 @@ fn append_active_counters(lines: &mut Vec<Line<'static>>, t: &PortThroughput, tc
     let counters: Vec<_> = t
         .counter_rates
         .iter()
-        .filter(|r| DETAIL_COUNTERS.contains(&r.name.as_str()))
+        .filter(|r| EXTRA_COUNTERS.contains(&r.name.as_str()))
         .collect();
     if !counters.is_empty() {
         for r in &counters {
@@ -451,7 +556,14 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let history = app.history.get(&t.dev_name);
     let procs = app.selected_device_processes();
-    let lines = build_detail_lines(&t, &procs, history, tc, app.show_rolling_avg, app.rolling_avg.window_secs);
+    let lines = build_detail_lines(
+        &t,
+        &procs,
+        history,
+        tc,
+        app.show_rolling_avg,
+        app.rolling_avg.window_secs,
+    );
 
     let visible = area.height.saturating_sub(2);
     app.detail_max_scroll = (lines.len() as u16).saturating_sub(visible);
@@ -512,9 +624,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         "Enter:detail"
     };
     let avg_hint = if app.show_rolling_avg {
-        format!("  a:avg[ON {}s]  +/-:window", app.rolling_avg.window_secs)
+        format!(
+            "  a:avg[ON {}s]  +/-:window  w:set",
+            app.rolling_avg.window_secs
+        )
     } else {
-        "  a:avg".to_string()
+        "  a:avg  w:set".to_string()
     };
     let line = Line::from(vec![
         Span::styled(
@@ -549,6 +664,76 @@ fn draw_help_popup(frame: &mut Frame, tc: &ThemeColors) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.accent))
         .title(" Help (h/Esc to close) ")
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn draw_window_input_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+    let w = 40.min(area.width.saturating_sub(4));
+    let h = 5.min(area.height.saturating_sub(4));
+    let popup = centered_rect(area, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from(vec![
+            styled(" Window (1-300s): ", tc.muted, false),
+            styled(&app.window_input_buf, tc.accent, true),
+            styled("▏", tc.accent, false),
+        ]),
+        Line::from(styled(" Enter:confirm  Esc:cancel", tc.muted, false)),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent))
+        .title(" Set Avg Window ")
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn draw_column_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let all = all_columns();
+    let area = frame.area();
+    let w = 45.min(area.width.saturating_sub(4));
+    let h = ((all.len() + 4) as u16).min(area.height.saturating_sub(4));
+    let popup = centered_rect(area, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = all
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let enabled = app.columns.contains(col);
+            let marker = if enabled { "[x]" } else { "[ ]" };
+            let cursor = if i == app.column_picker_cursor {
+                "▶"
+            } else {
+                " "
+            };
+            let color = if i == app.column_picker_cursor {
+                tc.accent
+            } else if enabled {
+                tc.fg
+            } else {
+                tc.muted
+            };
+            Line::from(styled(
+                &format!(" {} {} {}", cursor, marker, col.label()),
+                color,
+                i == app.column_picker_cursor,
+            ))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent))
+        .title(" Columns (Space:toggle  Esc:close) ")
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
 
     frame.render_widget(Paragraph::new(lines).block(block), popup);

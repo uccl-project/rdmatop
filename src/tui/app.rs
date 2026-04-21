@@ -27,6 +27,98 @@ pub struct CounterRate {
     pub is_bytes: bool,
 }
 
+/// Columns available for the main throughput table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableColumn {
+    Device,
+    Port,
+    TxBar,
+    TxGbps,
+    RxBar,
+    RxGbps,
+    TxPps,
+    RxPps,
+    Drops,
+    /// A raw hw counter rate column, keyed by counter name.
+    Counter(String),
+}
+
+impl TableColumn {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Device => "Device".into(),
+            Self::Port => "Port".into(),
+            Self::TxBar => "TX ▏".into(),
+            Self::TxGbps => "TX Gbps".into(),
+            Self::RxBar => "RX ▏".into(),
+            Self::RxGbps => "RX Gbps".into(),
+            Self::TxPps => "TX pps".into(),
+            Self::RxPps => "RX pps".into(),
+            Self::Drops => "Drops/s".into(),
+            Self::Counter(name) => name.clone(),
+        }
+    }
+
+    pub fn width(&self) -> u16 {
+        match self {
+            Self::Device => 16,
+            Self::Port => 6,
+            Self::TxBar | Self::RxBar => BAR_WIDTH as u16,
+            Self::TxGbps | Self::RxGbps => 9,
+            Self::TxPps | Self::RxPps => 10,
+            Self::Drops => 9,
+            Self::Counter(name) => (name.len() as u16 + 2).max(12),
+        }
+    }
+}
+
+pub const BAR_WIDTH: usize = 12;
+
+/// All counter names that can be added as extra columns.
+pub const EXTRA_COUNTERS: &[&str] = &[
+    "send_bytes",
+    "send_wrs",
+    "recv_bytes",
+    "recv_wrs",
+    "rdma_write_bytes",
+    "rdma_write_wrs",
+    "rdma_write_wr_err",
+    "rdma_write_recv_bytes",
+    "rdma_read_bytes",
+    "rdma_read_wrs",
+    "rdma_read_wr_err",
+    "rdma_read_resp_bytes",
+    "retrans_bytes",
+    "retrans_pkts",
+    "retrans_timeout_events",
+    "unresponsive_remote_events",
+    "impaired_remote_conn_events",
+];
+
+/// Returns the default set of visible columns.
+pub fn default_columns() -> Vec<TableColumn> {
+    vec![
+        TableColumn::Device,
+        TableColumn::Port,
+        TableColumn::TxBar,
+        TableColumn::TxGbps,
+        TableColumn::RxBar,
+        TableColumn::RxGbps,
+        TableColumn::TxPps,
+        TableColumn::RxPps,
+        TableColumn::Drops,
+    ]
+}
+
+/// Returns all possible columns (built-in + extra counters).
+pub fn all_columns() -> Vec<TableColumn> {
+    let mut cols = default_columns();
+    for name in EXTRA_COUNTERS {
+        cols.push(TableColumn::Counter(name.to_string()));
+    }
+    cols
+}
+
 /// Rolling average calculator: stores recent PortThroughput samples per device
 /// and computes the mean over a configurable window.
 pub struct RollingAvgState {
@@ -36,8 +128,8 @@ pub struct RollingAvgState {
     pub window_secs: usize,
 }
 
-pub const ROLLING_AVG_DEFAULT_WINDOW: usize = 30;
-const ROLLING_AVG_MIN_WINDOW: usize = 5;
+pub const ROLLING_AVG_DEFAULT_WINDOW: usize = 5;
+const ROLLING_AVG_MIN_WINDOW: usize = 1;
 const ROLLING_AVG_MAX_WINDOW: usize = 300;
 
 impl RollingAvgState {
@@ -55,8 +147,8 @@ impl RollingAvgState {
             let buf = self
                 .samples
                 .entry(key)
-                .or_insert_with(|| VecDeque::with_capacity(self.window_secs + 1));
-            if buf.len() >= self.window_secs {
+                .or_insert_with(|| VecDeque::with_capacity(ROLLING_AVG_MAX_WINDOW + 1));
+            if buf.len() >= ROLLING_AVG_MAX_WINDOW {
                 buf.pop_front();
             }
             buf.push_back(t.clone());
@@ -71,25 +163,27 @@ impl RollingAvgState {
                 if buf.is_empty() {
                     return None;
                 }
-                let n = buf.len() as f64;
-                let first = buf.front().unwrap();
+                let start = buf.len().saturating_sub(self.window_secs);
+                let window: Vec<_> = buf.iter().skip(start).collect();
+                let n = window.len() as f64;
+                let first = window[0];
                 let mut avg = PortThroughput {
                     dev_name: first.dev_name.clone(),
                     port: first.port,
-                    tx_gbps: buf.iter().map(|s| s.tx_gbps).sum::<f64>() / n,
-                    rx_gbps: buf.iter().map(|s| s.rx_gbps).sum::<f64>() / n,
-                    tx_pkts_per_sec: buf.iter().map(|s| s.tx_pkts_per_sec).sum::<f64>() / n,
-                    rx_pkts_per_sec: buf.iter().map(|s| s.rx_pkts_per_sec).sum::<f64>() / n,
-                    rx_drops_per_sec: buf.iter().map(|s| s.rx_drops_per_sec).sum::<f64>() / n,
+                    tx_gbps: window.iter().map(|s| s.tx_gbps).sum::<f64>() / n,
+                    rx_gbps: window.iter().map(|s| s.rx_gbps).sum::<f64>() / n,
+                    tx_pkts_per_sec: window.iter().map(|s| s.tx_pkts_per_sec).sum::<f64>() / n,
+                    rx_pkts_per_sec: window.iter().map(|s| s.rx_pkts_per_sec).sum::<f64>() / n,
+                    rx_drops_per_sec: window.iter().map(|s| s.rx_drops_per_sec).sum::<f64>() / n,
                     counter_rates: Vec::new(),
                 };
                 // Average each counter rate
-                if let Some(template) = buf.back() {
+                if let Some(template) = window.last() {
                     avg.counter_rates = template
                         .counter_rates
                         .iter()
                         .map(|cr| {
-                            let sum_rate: f64 = buf
+                            let sum_rate: f64 = window
                                 .iter()
                                 .filter_map(|s| {
                                     s.counter_rates
@@ -98,7 +192,7 @@ impl RollingAvgState {
                                         .map(|r| r.rate)
                                 })
                                 .sum();
-                            let sum_delta: u64 = buf
+                            let sum_delta: u64 = window
                                 .iter()
                                 .filter_map(|s| {
                                     s.counter_rates
@@ -109,7 +203,7 @@ impl RollingAvgState {
                                 .sum();
                             CounterRate {
                                 name: cr.name.clone(),
-                                delta: sum_delta / buf.len() as u64,
+                                delta: sum_delta / window.len() as u64,
                                 rate: sum_rate / n,
                                 is_bytes: cr.is_bytes,
                             }
@@ -122,21 +216,26 @@ impl RollingAvgState {
     }
 
     pub fn sample_count(&self) -> usize {
-        self.samples.values().map(|b| b.len()).max().unwrap_or(0)
+        self.samples
+            .values()
+            .map(|b| b.len().min(self.window_secs))
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn increase_window(&mut self) {
-        self.window_secs = (self.window_secs + 5).min(ROLLING_AVG_MAX_WINDOW);
+        self.window_secs = (self.window_secs + 1).min(ROLLING_AVG_MAX_WINDOW);
     }
 
     pub fn decrease_window(&mut self) {
-        self.window_secs = self.window_secs.saturating_sub(5).max(ROLLING_AVG_MIN_WINDOW);
-        // Trim existing buffers to new window size
-        for buf in self.samples.values_mut() {
-            while buf.len() > self.window_secs {
-                buf.pop_front();
-            }
-        }
+        self.window_secs = self
+            .window_secs
+            .saturating_sub(1)
+            .max(ROLLING_AVG_MIN_WINDOW);
+    }
+
+    pub fn set_window(&mut self, secs: usize) {
+        self.window_secs = secs.clamp(ROLLING_AVG_MIN_WINDOW, ROLLING_AVG_MAX_WINDOW);
     }
 }
 
@@ -159,6 +258,13 @@ pub struct App {
     pub elapsed: f64,
     pub rolling_avg: RollingAvgState,
     pub show_rolling_avg: bool,
+    pub show_window_input: bool,
+    pub window_input_buf: String,
+    pub columns: Vec<TableColumn>,
+    pub show_column_picker: bool,
+    pub column_picker_cursor: usize,
+    pub h_scroll: usize,
+    pub h_scroll_max: usize,
 }
 
 const HISTORY_LEN: usize = 60;
@@ -222,6 +328,13 @@ impl App {
             elapsed: 1.0,
             rolling_avg: RollingAvgState::new(ROLLING_AVG_DEFAULT_WINDOW),
             show_rolling_avg: false,
+            show_window_input: false,
+            window_input_buf: String::new(),
+            columns: default_columns(),
+            show_column_picker: false,
+            column_picker_cursor: 0,
+            h_scroll: 0,
+            h_scroll_max: 0,
         }
     }
 
@@ -318,14 +431,86 @@ impl App {
         self.rolling_avg.decrease_window();
     }
 
+    pub fn open_window_input(&mut self) {
+        self.window_input_buf = self.rolling_avg.window_secs.to_string();
+        self.show_window_input = true;
+    }
+
+    pub fn cancel_window_input(&mut self) {
+        self.show_window_input = false;
+        self.window_input_buf.clear();
+    }
+
+    pub fn confirm_window_input(&mut self) {
+        if let Ok(val) = self.window_input_buf.parse::<usize>() {
+            self.rolling_avg
+                .set_window(val.clamp(ROLLING_AVG_MIN_WINDOW, ROLLING_AVG_MAX_WINDOW));
+        }
+        self.show_window_input = false;
+        self.window_input_buf.clear();
+    }
+
+    pub fn open_column_picker(&mut self) {
+        self.show_column_picker = true;
+        self.column_picker_cursor = 0;
+    }
+
+    pub fn close_column_picker(&mut self) {
+        self.show_column_picker = false;
+    }
+
+    pub fn column_picker_up(&mut self) {
+        self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1);
+    }
+
+    pub fn column_picker_down(&mut self) {
+        let max = all_columns().len().saturating_sub(1);
+        if self.column_picker_cursor < max {
+            self.column_picker_cursor += 1;
+        }
+    }
+
+    pub fn column_picker_toggle(&mut self) {
+        let all = all_columns();
+        if let Some(col) = all.get(self.column_picker_cursor) {
+            if let Some(pos) = self.columns.iter().position(|c| c == col) {
+                self.columns.remove(pos);
+            } else {
+                self.columns.push(col.clone());
+            }
+        }
+        self.clamp_h_scroll();
+    }
+
+    pub fn scroll_left(&mut self) {
+        self.h_scroll = self.h_scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_right(&mut self) {
+        if self.h_scroll < self.h_scroll_max {
+            self.h_scroll += 1;
+        }
+    }
+
+    pub fn clamp_h_scroll(&mut self) {
+        if self.h_scroll >= self.columns.len() {
+            self.h_scroll = self.columns.len().saturating_sub(1);
+        }
+    }
+
     /// Returns the throughputs to display: rolling avg if enabled, otherwise instant.
     pub fn display_throughputs(&self) -> Vec<PortThroughput> {
         if self.show_rolling_avg {
             let mut avgs = self.rolling_avg.averages();
-            // Sort to match the order of self.throughputs
+            // Sort to match the order of self.throughputs (not alphabetically)
             avgs.sort_by(|a, b| {
-                let key = |t: &PortThroughput| (t.dev_name.clone(), t.port);
-                key(a).cmp(&key(b))
+                let pos = |t: &PortThroughput| {
+                    self.throughputs
+                        .iter()
+                        .position(|s| s.dev_name == t.dev_name && s.port == t.port)
+                        .unwrap_or(usize::MAX)
+                };
+                pos(a).cmp(&pos(b))
             });
             avgs
         } else {
