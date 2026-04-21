@@ -177,15 +177,11 @@ fn parse_single_qp(nla: &Nla, dev_name: &str) -> Option<QpInfo> {
     for attr in nla.nested() {
         match attr.attr_type {
             RDMA_NLDEV_ATTR_RES_LQPN => qp.lqpn = attr.u32(),
-            RDMA_NLDEV_ATTR_RES_TYPE => {
-                if !attr.data.is_empty() {
-                    qp.qp_type = attr.data[0];
-                }
+            RDMA_NLDEV_ATTR_RES_TYPE if !attr.data.is_empty() => {
+                qp.qp_type = attr.data[0];
             }
-            RDMA_NLDEV_ATTR_RES_STATE => {
-                if !attr.data.is_empty() {
-                    qp.state = attr.data[0];
-                }
+            RDMA_NLDEV_ATTR_RES_STATE if !attr.data.is_empty() => {
+                qp.state = attr.data[0];
             }
             RDMA_NLDEV_ATTR_RES_PID => {
                 qp.pid = attr.u32();
