@@ -28,6 +28,7 @@ spec:
                 - p6-b200.48xlarge
                 - p6-b300.48xlarge
       hostNetwork: true
+      hostPID: true
       containers:
         - name: rdmatop
           image: rdmatop:latest

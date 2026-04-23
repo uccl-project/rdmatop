@@ -47,6 +47,7 @@ communication benchmarks:
 - [NVSHMEM](examples/nvshmem/) — one-sided GPU communication
 - [PPLX Kernels](examples/pplx/) — MoE all-to-all dispatch/combine
 - [RDMA Statistics](examples/rdma/) — shell-based RDMA stats
+- [Kubernetes](examples/kubernetes/) — DaemonSet deployment for Kubernetes
 
 ## How It Works
 

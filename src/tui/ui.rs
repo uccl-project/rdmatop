@@ -274,7 +274,7 @@ fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<
 }
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
-    let display = app.display_throughputs();
+    let display = app.display_throughputs().to_vec();
     let title = if app.show_rolling_avg {
         format!(" RDMA Throughput (avg {}s) ", app.rolling_avg.window_secs)
     } else {
@@ -294,8 +294,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
             .iter()
             .skip(app.h_scroll)
             .scan(0usize, |used, col| {
-                let w = col.width() as usize + 1;
-                if *used + col.width() as usize <= avail {
+                let sep = if *used > 0 { 1 } else { 0 };
+                let w = col.width() as usize + sep;
+                if *used + w <= avail {
                     *used += w;
                     Some(col)
                 } else {
@@ -368,7 +369,16 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let mut state = TableState::default();
     if !display.is_empty() {
+        let viewport = area.height.saturating_sub(4) as usize; // borders + header
+        if viewport > 0 {
+            if app.selected_row >= app.table_offset + viewport {
+                app.table_offset = app.selected_row + 1 - viewport;
+            } else if app.selected_row < app.table_offset {
+                app.table_offset = app.selected_row;
+            }
+        }
         state.select(Some(app.selected_row));
+        *state.offset_mut() = app.table_offset;
     }
     frame.render_stateful_widget(table, area, &mut state);
 
