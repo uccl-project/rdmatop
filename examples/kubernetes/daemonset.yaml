@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rdmatop
+  labels:
+    app: rdmatop
+spec:
+  selector:
+    matchLabels:
+      app: rdmatop
+  template:
+    metadata:
+      labels:
+        app: rdmatop
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - p5.48xlarge
+                - p5e.48xlarge
+                - p5en.48xlarge
+                - p6e-gb200.36xlarge
+                - p6-b200.48xlarge
+                - p6-b300.48xlarge
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: rdmatop
+          image: rdmatop:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+      tolerations:
+        - operator: Exists
