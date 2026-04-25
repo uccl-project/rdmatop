@@ -22,3 +22,9 @@ override_dh_auto_test:
 override_dh_auto_clean:
 	cargo clean --offline || true
 	rm -rf $(CARGO_HOME)
+
+# dh_clean defaults to deleting *.orig files (treats them as backups).
+# cargo vendor's Cargo.toml.orig files are metadata required by
+# cargo's offline checksum verification — keep them.
+override_dh_clean:
+	dh_clean -X.orig
