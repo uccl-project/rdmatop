@@ -20,11 +20,23 @@ all via RDMA netlink, the same interface used by [rdma statistic](https://github
 
 ## Installation
 
+### Ubuntu (PPA)
+
+On Ubuntu 22.04 (jammy) or 24.04 (noble):
+
+```bash
+sudo add-apt-repository ppa:crazyguitar/rdmatop
+sudo apt update
+sudo apt install rdmatop
+```
+
+### Cargo
+
 ```bash
 cargo install rdmatop
 ```
 
-Or build from source:
+### From source
 
 ```bash
 make         # cargo build
