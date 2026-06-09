@@ -39,7 +39,7 @@ follows the `<tool> [opts] [server_ip]` convention works.
 ## Examples
 
 ```bash
-# RDMA write bandwidth, 10s, 1 QP, mlx5_1
+# RDMA write bandwidth, 30s, 1 QP, mlx5_1
 ./examples/ib/ib.sh amd0 amd1
 
 # RDMA read bandwidth
