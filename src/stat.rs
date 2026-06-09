@@ -83,7 +83,44 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
             _ => {}
         }
     }
-    (!stat.dev_name.is_empty()).then_some(stat)
+    if stat.dev_name.is_empty() {
+        return None;
+    }
+    fill_missing_from_sysfs(&mut stat);
+    Some(stat)
+}
+
+// Standard IB port counters in /sys/class/infiniband/<dev>/ports/<n>/counters/
+// are exposed by every RDMA provider. Mellanox doesn't publish tx_bytes/rx_bytes
+// as hw_counters (those are Broadcom-specific), so we synthesize them here
+// from the standard names. Data fields are in 4-byte words per IB spec.
+const SYSFS_FALLBACK: &[(&str, &str, u64)] = &[
+    ("tx_bytes", "port_xmit_data", 4),
+    ("rx_bytes", "port_rcv_data", 4),
+    ("tx_pkts", "port_xmit_packets", 1),
+    ("rx_pkts", "port_rcv_packets", 1),
+];
+
+fn fill_missing_from_sysfs(stat: &mut PortStat) {
+    for (synth_name, file, mult) in SYSFS_FALLBACK {
+        if stat.counters.iter().any(|c| c.name == *synth_name) {
+            continue;
+        }
+        let path = format!(
+            "/sys/class/infiniband/{}/ports/{}/counters/{}",
+            stat.dev_name, stat.port, file
+        );
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = raw.trim().parse::<u64>() else {
+            continue;
+        };
+        stat.counters.push(HwCounter {
+            name: (*synth_name).to_string(),
+            value: v.saturating_mul(*mult),
+        });
+    }
 }
 
 fn enumerate_devices(sock: &NlSocket) -> io::Result<Vec<RdmaDev>> {
