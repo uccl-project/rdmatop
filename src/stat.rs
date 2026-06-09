@@ -90,11 +90,13 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
     Some(stat)
 }
 
-// Standard IB port counters in /sys/class/infiniband/<dev>/ports/<n>/counters/
-// are exposed by every RDMA provider. Mellanox doesn't publish tx_bytes/rx_bytes
-// as hw_counters (those are Broadcom-specific), so we synthesize them here
-// from the standard names. Data fields are in 4-byte words per IB spec.
-const SYSFS_FALLBACK: &[(&str, &str, u64)] = &[
+// Names whose values in /sys/.../counters/ are in 4-byte words per IB spec.
+const SYSFS_DATA_COUNTERS: &[&str] = &["port_xmit_data", "port_rcv_data"];
+
+// rdmatop-canonical names synthesized from the standard sysfs counters so the
+// throughput row works for providers that don't expose tx_bytes/rx_bytes as
+// hw_counters (e.g., Mellanox mlx5).
+const SYSFS_SYNTH: &[(&str, &str, u64)] = &[
     ("tx_bytes", "port_xmit_data", 4),
     ("rx_bytes", "port_rcv_data", 4),
     ("tx_pkts", "port_xmit_packets", 1),
@@ -102,23 +104,59 @@ const SYSFS_FALLBACK: &[(&str, &str, u64)] = &[
 ];
 
 fn fill_missing_from_sysfs(stat: &mut PortStat) {
-    for (synth_name, file, mult) in SYSFS_FALLBACK {
+    let dir = format!(
+        "/sys/class/infiniband/{}/ports/{}/counters",
+        stat.dev_name, stat.port
+    );
+
+    // Ingest every standard IB port counter that the driver exposes via sysfs
+    // (link_downed, port_xmit_discards, port_xmit_wait, port_rcv_errors, ...).
+    // These are not surfaced by RDMA netlink, so iproute2's `rdma statistic`
+    // misses them too.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if stat.counters.iter().any(|c| c.name == name) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(v) = raw.trim().parse::<u64>() else {
+                continue;
+            };
+            let value = if SYSFS_DATA_COUNTERS.contains(&name.as_str()) {
+                v.saturating_mul(4)
+            } else {
+                v
+            };
+            stat.counters.push(HwCounter { name, value });
+        }
+    }
+
+    // Synthesize canonical {tx,rx}_{bytes,pkts} from the standard names so the
+    // top-level throughput row lights up even when the driver doesn't publish
+    // them under those names.
+    for (synth_name, src_name, mult) in SYSFS_SYNTH {
         if stat.counters.iter().any(|c| c.name == *synth_name) {
             continue;
         }
-        let path = format!(
-            "/sys/class/infiniband/{}/ports/{}/counters/{}",
-            stat.dev_name, stat.port, file
-        );
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Some(src) = stat.counters.iter().find(|c| c.name == *src_name) else {
             continue;
         };
-        let Ok(v) = raw.trim().parse::<u64>() else {
-            continue;
+        // src value is already in bytes (we converted port_*_data above), so
+        // for bytes counters mult is 1 in effect. Keep the mult only for
+        // names whose source hasn't been pre-converted.
+        let base = if SYSFS_DATA_COUNTERS.contains(src_name) {
+            src.value
+        } else {
+            src.value.saturating_mul(*mult)
         };
         stat.counters.push(HwCounter {
             name: (*synth_name).to_string(),
-            value: v.saturating_mul(*mult),
+            value: base,
         });
     }
 }

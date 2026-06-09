@@ -22,6 +22,7 @@ pub struct PortThroughput {
 #[derive(Clone, Debug)]
 pub struct CounterRate {
     pub name: String,
+    pub value: u64,
     pub delta: u64,
     pub rate: f64,
     pub is_bytes: bool,
@@ -212,6 +213,7 @@ impl RollingAvgState {
         if n == 0 {
             return CounterRate {
                 name: cr.name.clone(),
+                value: cr.value,
                 delta: 0,
                 rate: 0.0,
                 is_bytes: cr.is_bytes,
@@ -219,8 +221,10 @@ impl RollingAvgState {
         }
         let sum_rate: f64 = present.iter().map(|r| r.rate).sum();
         let sum_delta: u64 = present.iter().map(|r| r.delta).sum();
+        let latest_value = present.last().map(|r| r.value).unwrap_or(cr.value);
         CounterRate {
             name: cr.name.clone(),
+            value: latest_value,
             delta: sum_delta / n as u64,
             rate: sum_rate / n as f64,
             is_bytes: cr.is_bytes,
@@ -687,6 +691,7 @@ fn compute_counter_rate(
     let delta = curr_val.saturating_sub(prev_val);
     CounterRate {
         name: counter_name.to_string(),
+        value: curr_val,
         delta,
         rate: delta as f64 / elapsed,
         is_bytes: is_bytes_counter(counter_name),

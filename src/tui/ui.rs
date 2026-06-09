@@ -494,11 +494,25 @@ fn build_device_header(
 }
 
 fn append_active_counters(lines: &mut Vec<Line<'static>>, t: &PortThroughput, tc: &ThemeColors) {
-    let counters: Vec<_> = t
+    // Show every counter that's actually carrying signal:
+    //   - currently changing (delta/rate > 0), or
+    //   - has accumulated some non-zero value, or
+    //   - is in the curated EXTRA_COUNTERS list (always shown for visibility).
+    // This surfaces useful Mellanox metrics like rnr_nak_retry_err, link_downed,
+    // port_xmit_discards, etc. that the previous allow-list filter hid.
+    let mut counters: Vec<_> = t
         .counter_rates
         .iter()
-        .filter(|r| EXTRA_COUNTERS.contains(&r.name.as_str()))
+        .filter(|r| r.value > 0 || EXTRA_COUNTERS.contains(&r.name.as_str()))
         .collect();
+    // Most useful first: active rates, then accumulated, then alphabetical.
+    counters.sort_by(|a, b| {
+        b.rate
+            .partial_cmp(&a.rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.value.cmp(&a.value))
+            .then(a.name.cmp(&b.name))
+    });
     if !counters.is_empty() {
         for r in &counters {
             lines.push(counter_rate_line(r, tc));
