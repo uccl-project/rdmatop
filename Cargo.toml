@@ -1,6 +1,6 @@
 [package]
 name = "rdmatop"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "A real-time TUI monitor for RDMA network interfaces"
 license = "Apache-2.0"
