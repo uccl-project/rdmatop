@@ -189,7 +189,6 @@ fn query_port_stats(
 }
 
 /// Query all RDMA device/port hw counters via netlink.
-/// Query all RDMA device/port hw counters via netlink.
 pub fn read_all_stats() -> io::Result<Vec<PortStat>> {
     let sock = NlSocket::open(NETLINK_RDMA)?;
     let devs = enumerate_devices(&sock)?;
