@@ -4,7 +4,7 @@ version = "0.1.10"
 edition = "2021"
 description = "A real-time TUI monitor for RDMA network interfaces"
 license = "Apache-2.0"
-repository = "https://github.com/crazyguitar/rdmatop"
+repository = "https://github.com/uccl-project/rdmatop"
 keywords = ["rdma", "efa", "networking", "tui", "infiniband"]
 categories = ["network-programming", "command-line-utilities"]
 
