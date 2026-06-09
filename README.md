@@ -54,6 +54,7 @@ rdmatop
 Use `rdmatop` to monitor RDMA traffic while running GPU
 communication benchmarks:
 
+- [IB Perftest](examples/ib/) — two-node `ib_write_bw` benchmark via mpirun
 - [NCCL](examples/nccl/) — collective communication
 - [NIXL](examples/nixl/) — point-to-point KV cache transfer
 - [NVSHMEM](examples/nvshmem/) — one-sided GPU communication
