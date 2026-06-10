@@ -54,9 +54,56 @@ IB_EXTRA="-a" ./examples/ib/ib.sh host1 host2
 # Use a different RDMA device + matching netdev
 IB_DEV=mlx5_0 IB_NETDEV=enp49s0f0np0 ./examples/ib/ib.sh host1 host2
 
+# RoCE (e.g. Broadcom bnxt_re). See "Picking a GID on RoCE" below
+# for what `-x 3` means and how to find the right index.
+IB_DEV=bnxt_re0 IB_NETDEV=enp49s0f1np1 IB_EXTRA="-x 3" \
+  ./examples/ib/ib.sh host1 host2
+
 # Pin to a specific Slurm partition
 SRUN_EXTRA="-p all" ./examples/ib/ib.sh host1 host2
 ```
+
+## Picking a GID on RoCE
+
+From `ib_write_bw --help`:
+
+```
+-x, --gid-index=<index>   Test uses GID with GID index taken from command line
+```
+
+So when `IB_EXTRA="-x 3"` is passed to perftest it expands to
+`ib_write_bw -d bnxt_re0 -F -x 3 ...`. The `-x 3` tells the NIC
+"use GID index 3 from `bnxt_re0`'s GID table."
+
+Mapping the three env vars to what they do:
+
+| In your command         | Becomes perftest flag   | Meaning                                                          |
+|-------------------------|-------------------------|------------------------------------------------------------------|
+| `IB_DEV=bnxt_re0`       | `-d bnxt_re0`           | which RDMA NIC to open                                           |
+| `IB_NETDEV=enp49s0f1np1`| *(not a perftest flag)* | used only by `ib.sh` to look up host1's IPv4 for the TCP handshake |
+| `IB_EXTRA="-x 3"`       | `-x 3`                  | which GID entry on that NIC to use for the RDMA connection       |
+
+You **are** using GID — `-x 3` is literally selecting GID index 3.
+The word "GID" doesn't appear in the command because perftest's
+flag for it is just `-x`. Without `-x`, perftest defaults to index
+0, which on many RoCE NICs is RoCEv1 link-local and won't route
+between hosts.
+
+To list the GID table (when `show_gids` isn't installed):
+
+```bash
+DEV=bnxt_re0
+for i in /sys/class/infiniband/$DEV/ports/1/gids/*; do
+  idx=$(basename "$i"); gid=$(cat "$i")
+  [[ "$gid" == "0000:0000:0000:0000:0000:0000:0000:0000" ]] && continue
+  type=$(cat /sys/class/infiniband/$DEV/ports/1/gid_attrs/types/$idx)
+  ndev=$(cat /sys/class/infiniband/$DEV/ports/1/gid_attrs/ndevs/$idx)
+  echo "idx=$idx type=$type ndev=$ndev gid=$gid"
+done
+```
+
+Pick a `RoCE v2` entry on the right `ndev`, prefer a routable
+(non `fe80::`) GID, and use the same index on both hosts.
 
 ## Environment Variables
 
