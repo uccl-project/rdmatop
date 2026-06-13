@@ -22,7 +22,7 @@ all via RDMA netlink, the same interface used by [rdma statistic](https://github
 
 ### Ubuntu (PPA)
 
-On Ubuntu 22.04 (jammy) or 24.04 (noble):
+On Ubuntu 22.04 (jammy), 24.04 (noble), or 26.04 (resolute):
 
 ```bash
 sudo add-apt-repository ppa:crazyguitar/rdmatop

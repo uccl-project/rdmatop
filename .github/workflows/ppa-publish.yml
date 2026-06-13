@@ -9,9 +9,9 @@ on:
         description: "Version to publish (e.g. 0.1.6). Defaults to the tag."
         required: false
       series:
-        description: "Comma-separated Ubuntu series (e.g. noble,jammy). Default: noble,jammy"
+        description: "Comma-separated Ubuntu series (e.g. resolute,noble,jammy). Default: resolute,noble,jammy"
         required: false
-        default: "noble,jammy"
+        default: "resolute,noble,jammy"
 
 jobs:
   resolve:
@@ -37,7 +37,7 @@ jobs:
             echo "Refusing unsafe version string: $VERSION" >&2
             exit 1
           fi
-          SERIES="${INPUT_SERIES:-noble,jammy}"
+          SERIES="${INPUT_SERIES:-resolute,noble,jammy}"
           # Whitelist series names (alnum only) before passing them downstream.
           MATRIX=$(printf '%s' "$SERIES" \
             | tr ',' '\n' \
