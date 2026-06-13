@@ -215,8 +215,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn gbps_bar(gbps: f64) -> String {
-    let ratio = (gbps / RDMA_LINK_GBPS).clamp(0.0, 1.0);
+fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
+    // Scale to the port's line rate; fall back to a default when unknown.
+    let max = link_gbps.filter(|&r| r > 0.0).unwrap_or(RDMA_LINK_GBPS);
+    let ratio = (gbps / max).clamp(0.0, 1.0);
     let filled = (ratio * BAR_WIDTH as f64).round() as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(BAR_WIDTH - filled))
 }
@@ -225,14 +227,12 @@ fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<
     match col {
         TableColumn::Device => Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
         TableColumn::Port => Cell::from(t.port.to_string()).style(Style::default().fg(tc.muted)),
-        TableColumn::TxBar => {
-            Cell::from(gbps_bar(t.tx_gbps)).style(Style::default().fg(gbps_color(t.tx_gbps, tc)))
-        }
+        TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
+            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
             .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
-        TableColumn::RxBar => {
-            Cell::from(gbps_bar(t.rx_gbps)).style(Style::default().fg(gbps_color(t.rx_gbps, tc)))
-        }
+        TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps))
+            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
         TableColumn::RxGbps => Cell::from(format!("{:.2}", t.rx_gbps))
             .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
         TableColumn::TxPps => {

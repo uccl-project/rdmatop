@@ -14,6 +14,8 @@ pub struct HwCounter {
 pub struct PortStat {
     pub dev_name: String,
     pub port: u32,
+    /// Port line rate in Gbps (from sysfs `rate`), None if unavailable.
+    pub link_gbps: Option<f64>,
     pub counters: Vec<HwCounter>,
 }
 
@@ -67,6 +69,7 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
     let mut stat = PortStat {
         dev_name: String::new(),
         port: 0,
+        link_gbps: None,
         counters: Vec::new(),
     };
     for nla in nlmsg.attrs() {
@@ -87,7 +90,15 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
         return None;
     }
     fill_missing_from_sysfs(&mut stat);
+    stat.link_gbps = read_port_link_gbps(&stat.dev_name, stat.port);
     Some(stat)
+}
+
+/// Parse the port line rate from sysfs, e.g. "400 Gb/sec (4X NDR)" -> 400.0.
+fn read_port_link_gbps(dev_name: &str, port: u32) -> Option<f64> {
+    let path = format!("/sys/class/infiniband/{}/ports/{}/rate", dev_name, port);
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.split_whitespace().next()?.parse::<f64>().ok()
 }
 
 // Names whose values in /sys/.../counters/ are in 4-byte words per IB spec.

@@ -66,6 +66,9 @@ PERF_SIZE=8 PERF_ITER=50000000 \
 UCX_DEV=mlx5_0:1 UCX_NETDEV=enp49s0f0np0 \
   ./examples/ucx/ucx.sh host1 host2
 
+# Data NIC whose netdev has no IPv4 (e.g. bnxt_re): set only UCX_DEV; add UCX_IB_GID_INDEX=3 if the RoCEv2 GID is wrong.
+UCX_DEV=bnxt_re0:1 ./examples/ucx/ucx.sh host1 host2
+
 # Pin to a Slurm partition / extra srun args
 SRUN_EXTRA="-p all" ./examples/ucx/ucx.sh host1 host2
 
@@ -97,7 +100,7 @@ BASE_IMAGE=rocm/dev-ubuntu-22.04:6.2.4 make
 | Variable                    | Default                              | Purpose                                                                                                                   |
 |-----------------------------|--------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `UCX_DEV`                   | `mlx5_1:1`                           | Exported as `UCX_NET_DEVICES`                                                                                             |
-| `UCX_NETDEV`                | `enp49s0f1np1`                       | Netdev paired with `UCX_DEV`; used to look up host1's IP                                                                  |
+| `UCX_NETDEV`                | `enp49s0f1np1`                       | Netdev used to look up host1's IP for wire-up; need not match `UCX_DEV`                                                   |
 | `PERF_SIZE`                 | `65536`                              | Message size, passed as `-s`                                                                                              |
 | `PERF_ITER`                 | `5000000`                            | Iterations, passed as `-n` (~30 s at 64 KB / 100 GbE)                                                                     |
 | `PERF_EXTRA`                | (empty)                              | Extra args appended verbatim to `ucx_perftest`                                                                            |

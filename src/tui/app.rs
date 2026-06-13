@@ -11,6 +11,8 @@ use std::collections::HashMap;
 pub struct PortThroughput {
     pub dev_name: String,
     pub port: u32,
+    /// Port line rate in Gbps, used to scale the throughput bar.
+    pub link_gbps: Option<f64>,
     pub tx_gbps: f64,
     pub rx_gbps: f64,
     pub tx_pkts_per_sec: f64,
@@ -183,6 +185,7 @@ impl RollingAvgState {
         let mut avg = PortThroughput {
             dev_name: first.dev_name.clone(),
             port: first.port,
+            link_gbps: first.link_gbps,
             tx_gbps: window.iter().map(|s| s.tx_gbps).sum::<f64>() / n,
             rx_gbps: window.iter().map(|s| s.rx_gbps).sum::<f64>() / n,
             tx_pkts_per_sec: window.iter().map(|s| s.tx_pkts_per_sec).sum::<f64>() / n,
@@ -723,6 +726,7 @@ fn compute_port_throughput(
     PortThroughput {
         dev_name: curr.dev_name.clone(),
         port: curr.port,
+        link_gbps: curr.link_gbps,
         tx_gbps: bytes_to_gbps(tx_bps),
         rx_gbps: bytes_to_gbps(rx_bps),
         tx_pkts_per_sec: rate_by_name(&counter_rates, "tx_pkts"),
