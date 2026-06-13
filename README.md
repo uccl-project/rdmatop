@@ -60,6 +60,7 @@ communication benchmarks:
 - [NIXL](examples/nixl/) — point-to-point KV cache transfer
 - [NVSHMEM](examples/nvshmem/) — one-sided GPU communication
 - [PPLX Kernels](examples/pplx/) — MoE all-to-all dispatch/combine
+- [UCCL](examples/uccl/) — DeepEP-compatible expert-parallel dispatch/combine
 - [RDMA Statistics](examples/rdma/) — shell-based RDMA stats
 - [Kubernetes](examples/kubernetes/) — DaemonSet deployment for Kubernetes
 
