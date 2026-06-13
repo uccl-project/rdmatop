@@ -17,10 +17,16 @@ First build the base image, then build the pplx image on top of it.
 The pplx image adds vLLM (< v0.16), DeepGEMM, and pplx-kernels:
 
 ```bash
+# Build the base efa image first (from the repo root)
 cd rdmatop
-make docker        # build the base efa image
-make pplx-docker   # build the pplx image (uses efa:latest as base)
+make docker
+
+# Then build the pplx image on top of it
+cd examples/pplx
+make               # docker build (FROM efa:latest) -> tar.gz + enroot sqsh
 ```
+
+Override `BASE_IMAGE=` if the base was built under a different name/tag.
 
 ## Examples
 
