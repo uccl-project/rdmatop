@@ -98,14 +98,6 @@ nodes. You should see traffic on `bnxt_re*`.
 | `UCCL_IB_MAX_INFLIGHT_NORMAL`  | `1` (auto, `bnxt_re` only)         | Broadcom Thor2 flow-control cap (per upstream).                                                           |
 | `BNXT_LIB`                     | auto (`find` over `/usr/local/lib`, `/usr/lib64`, `/usr/lib`) | Host path of Broadcom's vendor `bnxt_re` userspace driver, bind-mounted over the container's rdma-core provider. |
 
-## Troubleshooting
-
-- **`libibverbs: Warning: Driver bnxt_re does not support the kernel ABI of N (supports 1 to 1)`** -- The container is running upstream rdma-core's `bnxt_re` provider, i.e. the host's vendor lib wasn't found and mounted. Check the compute nodes have `libbnxt_re-rdmav*.so` (Broadcom's `bnxt_rocelib` installs to `/usr/local/lib`), or point `BNXT_LIB=` at it explicitly.
-- **`NCCL WARN socketPollConnect: connect to 127.0.0.1<...>`** -- pyxis cached an old container under `--container-name=uccl-ep`. Run `enroot remove -f pyxis_uccl-ep` on each node and re-launch.
-- **`connect to <other-rank>` times out / hangs at NCCL init** -- check `SOCKET_IFNAME`: the auto-detected iface must be reachable on both nodes. Run `scontrol show node <node>` and verify `NodeAddr` is routable across nodes.
-- **`Invalid argument` from `ibv_reg_mr_iova2`** / **`RDMA buffer MR registration failed: Bad address`** -- GPU memory can't be registered for RDMA because no peer-mem client services the selected NIC. `modprobe` a peer-mem module and confirm it bound to your driver: `lsmod | grep ib_peer_mem` should show `bnxt_re` as a user.
-- **`NET/IB: Got completion ... with status=12` (retry exceeded)** -- RoCE packets never reach the peer. Compare `localGid` / `remoteGids` in the warning: if the paired ports sit on different subnets (e.g. frontend NICs with one public and one private port), there is no RoCEv2 route. Pin `HCA_PREFIX=` to a single fabric whose ports share a subnet across nodes.
-
 ## Related Links
 
 - [UCCL](https://github.com/uccl-project/uccl) -- the upstream repo
