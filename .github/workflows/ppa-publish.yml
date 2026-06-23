@@ -67,7 +67,7 @@ jobs:
       PPA: ppa:crazyguitar/rdmatop
       KEY_ID: ${{ secrets.LAUNCHPAD_GPG_KEY_ID }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build tooling
         run: |
