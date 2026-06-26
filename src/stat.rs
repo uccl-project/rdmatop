@@ -115,13 +115,22 @@ const SYSFS_SYNTH: &[(&str, &str, u64)] = &[
 ];
 
 // Alias mapping for erdma which exposes hw counters under names like
-// hw_tx_bytes_cnt instead of the canonical tx_bytes.
+// hw_tx_bytes_cnt instead of the canonical tx_bytes. Both naming forms exist:
+// the original 2023 patch / Alibaba Cloud kernel use the hw_ prefix, mainline
+// erdma_descs dropped it (tx_bytes_cnt). Match either.
+// hw_ form:  https://www.spinics.net/lists/linux-rdma/msg121550.html
+// mainline:  https://github.com/torvalds/linux/blob/v6.12/drivers/infiniband/hw/erdma/erdma_verbs.c#L1770 (erdma_descs)
 const HW_COUNTER_ALIASES: &[(&str, &str)] = &[
     ("tx_bytes", "hw_tx_bytes_cnt"),
     ("rx_bytes", "hw_rx_bytes_cnt"),
     ("tx_pkts", "hw_tx_packets_cnt"),
     ("rx_pkts", "hw_rx_packets_cnt"),
     ("rx_drops", "hw_rx_disable_drop_cnt"),
+    ("tx_bytes", "tx_bytes_cnt"),
+    ("rx_bytes", "rx_bytes_cnt"),
+    ("tx_pkts", "tx_packets_cnt"),
+    ("rx_pkts", "rx_packets_cnt"),
+    ("rx_drops", "rx_disable_drop_cnt"),
 ];
 
 fn fill_missing_from_sysfs(stat: &mut PortStat) {
