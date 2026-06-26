@@ -114,6 +114,16 @@ const SYSFS_SYNTH: &[(&str, &str, u64)] = &[
     ("rx_pkts", "port_rcv_packets", 1),
 ];
 
+// Alias mapping for erdma which exposes hw counters under names like
+// hw_tx_bytes_cnt instead of the canonical tx_bytes.
+const HW_COUNTER_ALIASES: &[(&str, &str)] = &[
+    ("tx_bytes", "hw_tx_bytes_cnt"),
+    ("rx_bytes", "hw_rx_bytes_cnt"),
+    ("tx_pkts", "hw_tx_packets_cnt"),
+    ("rx_pkts", "hw_rx_packets_cnt"),
+    ("rx_drops", "hw_rx_disable_drop_cnt"),
+];
+
 fn fill_missing_from_sysfs(stat: &mut PortStat) {
     let dir = format!(
         "/sys/class/infiniband/{}/ports/{}/counters",
@@ -169,6 +179,21 @@ fn fill_missing_from_sysfs(stat: &mut PortStat) {
             name: (*synth_name).to_string(),
             value: base,
         });
+    }
+
+    // Alias hw_counter names for providers like erdma that use
+    // hw_tx_bytes_cnt instead of the canonical tx_bytes.
+    for (canonical, alias) in HW_COUNTER_ALIASES {
+        if stat.counters.iter().any(|c| c.name == *canonical) {
+            continue;
+        }
+        if let Some(src) = stat.counters.iter().find(|c| c.name == *alias) {
+            let value = src.value;
+            stat.counters.push(HwCounter {
+                name: canonical.to_string(),
+                value,
+            });
+        }
     }
 }
 
