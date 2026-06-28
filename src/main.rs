@@ -5,7 +5,7 @@ mod stat;
 mod tui;
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn run_tui() -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
@@ -16,11 +16,10 @@ fn run_tui() -> io::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut app = tui::app::App::new();
 
-    let interval = Duration::from_secs(1);
-    let mut last_refresh = Instant::now() - interval;
+    let mut last_refresh = Instant::now() - app.refresh_interval;
 
     loop {
-        if last_refresh.elapsed() >= interval {
+        if last_refresh.elapsed() >= app.refresh_interval {
             app.refresh_stats();
             last_refresh = Instant::now();
         }
