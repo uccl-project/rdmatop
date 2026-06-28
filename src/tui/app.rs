@@ -2,7 +2,7 @@ use super::theme::Theme;
 use crate::net::{self, IfStats, NetRate};
 use crate::stat::{self, PortStat};
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
@@ -76,6 +76,13 @@ impl TableColumn {
 }
 
 pub const BAR_WIDTH: usize = 12;
+
+/// Stats refresh interval bounds (seconds). Floor matches the 200ms event-poll
+/// so input stays responsive even at the fastest setting.
+pub const REFRESH_DEFAULT_SECS: f64 = 1.0;
+const REFRESH_MIN_SECS: f64 = 0.2;
+const REFRESH_MAX_SECS: f64 = 10.0;
+const REFRESH_STEP_SECS: f64 = 0.5;
 
 /// All counter names that can be added as extra columns.
 pub const EXTRA_COUNTERS: &[&str] = &[
@@ -274,7 +281,6 @@ pub struct App {
     prev_stats: Vec<PortStat>,
     prev_ifstats: Vec<IfStats>,
     prev_time: Instant,
-    pub elapsed: f64,
     pub rolling_avg: RollingAvgState,
     pub show_rolling_avg: bool,
     pub show_window_input: bool,
@@ -285,6 +291,7 @@ pub struct App {
     pub h_scroll: usize,
     pub h_scroll_max: usize,
     pub table_offset: usize,
+    pub refresh_interval: Duration,
     cached_display: Vec<PortThroughput>,
 }
 
@@ -346,7 +353,6 @@ impl App {
             prev_stats: stats,
             prev_ifstats: ifstats,
             prev_time: Instant::now(),
-            elapsed: 1.0,
             rolling_avg: RollingAvgState::new(ROLLING_AVG_DEFAULT_WINDOW),
             show_rolling_avg: false,
             show_window_input: false,
@@ -357,6 +363,7 @@ impl App {
             h_scroll: 0,
             h_scroll_max: 0,
             table_offset: 0,
+            refresh_interval: Duration::from_secs_f64(REFRESH_DEFAULT_SECS),
             cached_display: Vec::new(),
         }
     }
@@ -370,7 +377,6 @@ impl App {
         if elapsed < 0.1 {
             return;
         }
-        self.elapsed = elapsed;
         self.throughputs = compute_throughputs(&self.prev_stats, &curr, elapsed);
         self.prev_stats = curr;
 
@@ -472,6 +478,18 @@ impl App {
         if self.show_rolling_avg {
             self.recompute_display();
         }
+    }
+
+    /// Slow the refresh by one step (longer interval), clamped to the max.
+    pub fn increase_refresh_interval(&mut self) {
+        let secs = (self.refresh_interval.as_secs_f64() + REFRESH_STEP_SECS).min(REFRESH_MAX_SECS);
+        self.refresh_interval = Duration::from_secs_f64(secs);
+    }
+
+    /// Speed the refresh up by one step (shorter interval), clamped to the min.
+    pub fn decrease_refresh_interval(&mut self) {
+        let secs = (self.refresh_interval.as_secs_f64() - REFRESH_STEP_SECS).max(REFRESH_MIN_SECS);
+        self.refresh_interval = Duration::from_secs_f64(secs);
     }
 
     pub fn open_window_input(&mut self) {

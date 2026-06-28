@@ -55,6 +55,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('a') => app.toggle_rolling_avg(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.increase_avg_window(),
         KeyCode::Char('-') => app.decrease_avg_window(),
+        KeyCode::Char('>') => app.increase_refresh_interval(),
+        KeyCode::Char('<') => app.decrease_refresh_interval(),
         KeyCode::Char('w') => app.open_window_input(),
         KeyCode::Char('c') => app.open_column_picker(),
         _ => {}
@@ -71,6 +73,8 @@ fn handle_detail_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('a') => app.toggle_rolling_avg(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.increase_avg_window(),
         KeyCode::Char('-') => app.decrease_avg_window(),
+        KeyCode::Char('>') => app.increase_refresh_interval(),
+        KeyCode::Char('<') => app.decrease_refresh_interval(),
         KeyCode::Char('w') => app.open_window_input(),
         KeyCode::Char('c') => app.open_column_picker(),
         _ => {}

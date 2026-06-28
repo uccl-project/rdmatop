@@ -25,6 +25,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("+ / =", "Increase avg window (+1s)"),
     ("-", "Decrease avg window (-1s)"),
     ("w", "Set avg window (custom)"),
+    ("< / >", "Refresh faster / slower (±0.5s)"),
     ("c", "Configure columns"),
     ("h", "Toggle this help"),
     ("q", "Quit"),
@@ -122,6 +123,12 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
         String::new()
     };
 
+    let status = format!(
+        " │ refresh: {:.1}s │ theme: {}",
+        app.refresh_interval.as_secs_f64(),
+        app.theme.label()
+    );
+
     Line::from(vec![
         styled(
             &format!(" RDMA: {} device{}", n, if n == 1 { "" } else { "s" }),
@@ -134,11 +141,7 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
         styled(&format!("{:.2} Gbps", total_rx), tc.good, false),
         styled(" │ Drops: ", tc.muted, false),
         styled(&format!("{:.0}/s", total_drops), drop_color, false),
-        styled(
-            &format!(" │ {:.1}s │ theme: {}", app.elapsed, app.theme.label()),
-            tc.muted,
-            false,
-        ),
+        styled(&status, tc.muted, false),
         styled(&avg_label, tc.accent, false),
     ])
 }
@@ -655,19 +658,17 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     } else {
         "  a:avg  w:set".to_string()
     };
-    let line = Line::from(vec![
-        Span::styled(
-            " NORMAL ",
-            Style::default()
-                .fg(tc.status_fg)
-                .bg(tc.status_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" ↑↓/jk:nav  {}  t:theme  h:help  q:quit{}", hint, avg_hint),
-            Style::default().fg(tc.muted),
-        ),
-    ]);
+    let keys = format!(
+        " ↑↓/jk:nav  {}  t:theme  <>:refresh  h:help  q:quit{}",
+        hint, avg_hint
+    );
+    let mode_style = Style::default()
+        .fg(tc.status_fg)
+        .bg(tc.status_bg)
+        .add_modifier(Modifier::BOLD);
+    let mode = Span::styled(" NORMAL ", mode_style);
+    let keys = Span::styled(keys, Style::default().fg(tc.muted));
+    let line = Line::from(vec![mode, keys]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
