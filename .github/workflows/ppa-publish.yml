@@ -13,6 +13,9 @@ on:
         required: false
         default: "resolute,noble,jammy"
 
+permissions:
+  contents: read
+
 jobs:
   resolve:
     runs-on: ubuntu-24.04
