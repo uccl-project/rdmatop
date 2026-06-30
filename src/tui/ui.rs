@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
@@ -27,6 +27,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("w", "Set avg window (custom)"),
     ("< / >", "Refresh faster / slower (±0.5s)"),
     ("c", "Configure columns"),
+    ("r", "Record Perfetto trace (start/stop)"),
     ("h", "Toggle this help"),
     ("q", "Quit"),
     ("", ""),
@@ -659,7 +660,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         "  a:avg  w:set".to_string()
     };
     let keys = format!(
-        " ↑↓/jk:nav  {}  t:theme  <>:refresh  h:help  q:quit{}",
+        " ↑↓/jk:nav  {}  t:theme  <>:refresh  r:rec  h:help  q:quit{}",
         hint, avg_hint
     );
     let mode_style = Style::default()
@@ -668,8 +669,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .add_modifier(Modifier::BOLD);
     let mode = Span::styled(" NORMAL ", mode_style);
     let keys = Span::styled(keys, Style::default().fg(tc.muted));
-    let line = Line::from(vec![mode, keys]);
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = vec![mode];
+    if let Some((secs, samples)) = app.recording_progress() {
+        spans.push(Span::styled(
+            format!(" ● REC {}:{:02} ({}) ", secs / 60, secs % 60, samples),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(msg) = &app.record_status {
+        spans.push(Span::styled(
+            format!(" {} ", msg),
+            Style::default().fg(tc.fg),
+        ));
+    }
+    spans.push(keys);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help_popup(frame: &mut Frame, tc: &ThemeColors) {

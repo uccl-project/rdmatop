@@ -1,6 +1,7 @@
 use super::theme::Theme;
 use crate::net::{self, IfStats, NetRate};
 use crate::stat::{self, PortStat};
+use crate::trace::{PortMetrics, Recorder};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -293,6 +294,10 @@ pub struct App {
     pub table_offset: usize,
     pub refresh_interval: Duration,
     cached_display: Vec<PortThroughput>,
+    /// Active Perfetto recorder when recording; None when idle.
+    pub recorder: Option<Recorder>,
+    /// Transient message shown after a recording is saved or fails.
+    pub record_status: Option<String>,
 }
 
 const HISTORY_LEN: usize = 60;
@@ -365,6 +370,8 @@ impl App {
             table_offset: 0,
             refresh_interval: Duration::from_secs_f64(REFRESH_DEFAULT_SECS),
             cached_display: Vec::new(),
+            recorder: None,
+            record_status: None,
         }
     }
 
@@ -389,6 +396,9 @@ impl App {
         self.update_history();
         self.refresh_processes();
         self.rolling_avg.push(&self.throughputs);
+        if let Some(rec) = &mut self.recorder {
+            rec.push(port_metrics(&self.throughputs));
+        }
         self.sysinfo = read_sysinfo(net_rate);
         if self.cpu_history.len() >= HISTORY_LEN {
             self.cpu_history.remove(0);
@@ -464,6 +474,34 @@ impl App {
     pub fn toggle_rolling_avg(&mut self) {
         self.show_rolling_avg = !self.show_rolling_avg;
         self.recompute_display();
+    }
+
+    /// Toggle recording: start if idle; otherwise stop and flush the trace.
+    /// On a write error the buffer is kept so no captured data is lost.
+    pub fn toggle_recording(&mut self) {
+        let Some(rec) = self.recorder.take() else {
+            self.recorder = Some(Recorder::new());
+            self.record_status = None;
+            return;
+        };
+        if rec.is_empty() {
+            self.record_status = Some("recording stopped (nothing captured)".to_string());
+            return;
+        }
+        let path = trace_filename();
+        if let Err(e) = rec.write_to(&path) {
+            self.record_status = Some(format!("save failed: {} (still recording)", e));
+            self.recorder = Some(rec);
+            return;
+        }
+        self.record_status = Some(format!("saved {} ({} samples)", path, rec.sample_count()));
+    }
+
+    /// (elapsed seconds, sample count) for the active recording, if any.
+    pub fn recording_progress(&self) -> Option<(u64, usize)> {
+        self.recorder
+            .as_ref()
+            .map(|r| (r.elapsed_secs(), r.sample_count()))
     }
 
     pub fn increase_avg_window(&mut self) {
@@ -686,6 +724,31 @@ fn read_sysinfo(net: NetRate) -> SysInfo {
         cpu_pct: read_cpu_usage(),
         net,
     }
+}
+
+/// Map the display throughputs into the recorder's metric shape.
+fn port_metrics(throughputs: &[PortThroughput]) -> Vec<PortMetrics> {
+    throughputs
+        .iter()
+        .map(|t| PortMetrics {
+            dev_name: t.dev_name.clone(),
+            port: t.port,
+            tx_gbps: t.tx_gbps,
+            rx_gbps: t.rx_gbps,
+            tx_pps: t.tx_pkts_per_sec,
+            rx_pps: t.rx_pkts_per_sec,
+            rx_drops_per_sec: t.rx_drops_per_sec,
+        })
+        .collect()
+}
+
+/// Trace output path in the cwd, named by wall-clock seconds for uniqueness.
+fn trace_filename() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("rdmatop-{}.json", secs)
 }
 
 fn find_prev<'a>(prev: &'a [PortStat], dev: &str, port: u32) -> Option<&'a PortStat> {

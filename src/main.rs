@@ -2,6 +2,7 @@ mod net;
 mod netlink;
 mod rdma;
 mod stat;
+mod trace;
 mod tui;
 
 use std::io;

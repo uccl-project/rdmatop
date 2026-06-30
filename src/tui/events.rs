@@ -59,6 +59,7 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('<') => app.decrease_refresh_interval(),
         KeyCode::Char('w') => app.open_window_input(),
         KeyCode::Char('c') => app.open_column_picker(),
+        KeyCode::Char('r') => app.toggle_recording(),
         _ => {}
     }
 }
@@ -77,6 +78,7 @@ fn handle_detail_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('<') => app.decrease_refresh_interval(),
         KeyCode::Char('w') => app.open_window_input(),
         KeyCode::Char('c') => app.open_column_picker(),
+        KeyCode::Char('r') => app.toggle_recording(),
         _ => {}
     }
 }
