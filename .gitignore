@@ -296,3 +296,4 @@ tags
 [._]*.un~
 .cargo/
 vendor/
+.worktrees/
