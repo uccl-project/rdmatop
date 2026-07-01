@@ -49,6 +49,18 @@ make install # cargo install
 rdmatop
 ```
 
+## Perfetto recording
+
+Press `r` in the TUI to start recording and `r` again to stop. rdmatop captures
+every device's tx/rx Gbps and packets/s per interval and writes a Chrome-JSON
+trace (`rdmatop-<n>.json`) you can drag into [ui.perfetto.dev](https://ui.perfetto.dev)
+— each device/port becomes its own set of counter tracks. Timestamps are relative
+to when you pressed `r`, so the trace spans exactly your record window.
+
+<p align="center">
+  <img src="images/perfetto.png" alt="rdmatop Perfetto recording" width="800">
+</p>
+
 ## Examples
 
 Use `rdmatop` to monitor RDMA traffic while running GPU
