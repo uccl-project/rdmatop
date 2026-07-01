@@ -5,6 +5,9 @@ mod stat;
 mod trace;
 mod tui;
 
+#[cfg(feature = "nvlink")]
+mod nvlink;
+
 use std::io;
 use std::time::Instant;
 
