@@ -93,6 +93,8 @@ pub struct NvLinkSnapshot {
     /// Negotiated aggregate speed in Gbps, derived from the per-link
     /// `NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON` field when available.
     pub link_gbps: Option<f64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_bytes: Option<u64>,
     pub links: Vec<LinkSnapshot>,
 }
 
@@ -192,6 +194,8 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
         });
     }
 
+    let (tx_bytes, rx_bytes) = read_link_throughput(nvml, &device, u32::MAX);
+
     Some(NvLinkSnapshot {
         gpu_index: idx,
         gpu_name,
@@ -201,6 +205,8 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
         } else {
             None
         },
+        tx_bytes,
+        rx_bytes,
         links,
     })
 }
@@ -290,14 +296,14 @@ fn read_link_throughput(
     let tx_bytes = if tx.nvmlReturn == 0
         && tx.valueType == nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_LONG_LONG
     {
-        Some(unsafe { tx.value.ullVal })
+        Some(unsafe { tx.value.ullVal }.wrapping_mul(1024))
     } else {
         None
     };
     let rx_bytes = if rx.nvmlReturn == 0
         && rx.valueType == nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_LONG_LONG
     {
-        Some(unsafe { rx.value.ullVal })
+        Some(unsafe { rx.value.ullVal }.wrapping_mul(1024))
     } else {
         None
     };
@@ -343,6 +349,8 @@ mod tests {
             gpu_name: "test".to_string(),
             link_count: 4,
             link_gbps: None,
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 LinkSnapshot {
                     link_id: 0,
@@ -395,6 +403,8 @@ mod tests {
             gpu_name: "test".to_string(),
             link_count: 0,
             link_gbps: None,
+            tx_bytes: None,
+            rx_bytes: None,
             links: Vec::new(),
         };
         assert_eq!(snap.active_links(), 0);

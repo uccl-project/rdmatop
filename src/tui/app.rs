@@ -923,30 +923,58 @@ fn compute_nvlink_throughputs(
         let prev_gpu = prev.iter().find(|p| p.gpu_index == gpu.gpu_index);
         let mut counter_rates: Vec<CounterRate> = Vec::new();
 
-        // Pick a single link to source the GPU-wide TX/RX aggregate from.
-        // Prefer the first active link; if none are active, fall back to the
-        // first link in the list (its counters still represent the GPU).
-        let aggregate_link = gpu
-            .links
-            .iter()
-            .find(|l| l.is_active)
-            .or_else(|| gpu.links.first());
-
-        let (tx_bytes_total, rx_bytes_total) = match aggregate_link {
-            Some(link) => {
-                let prev_link =
-                    prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
-                let curr_tx = link.tx_bytes.unwrap_or(0);
-                let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
-                let curr_rx = link.rx_bytes.unwrap_or(0);
-                let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
-                (
-                    curr_tx.saturating_sub(prev_tx),
-                    curr_rx.saturating_sub(prev_rx),
-                )
+        // Calculate GPU-wide aggregate throughput, preferring the u32::MAX aggregate fields.
+        let (tx_bytes_total, rx_bytes_total) = if gpu.tx_bytes.is_some() || gpu.rx_bytes.is_some() {
+            let curr_tx = gpu.tx_bytes.unwrap_or(0);
+            let prev_tx = prev_gpu.and_then(|p| p.tx_bytes).unwrap_or(0);
+            let curr_rx = gpu.rx_bytes.unwrap_or(0);
+            let prev_rx = prev_gpu.and_then(|p| p.rx_bytes).unwrap_or(0);
+            (
+                curr_tx.saturating_sub(prev_tx),
+                curr_rx.saturating_sub(prev_rx),
+            )
+        } else {
+            // Fallback: Pick a single link to source the GPU-wide TX/RX aggregate from.
+            let aggregate_link = gpu
+                .links
+                .iter()
+                .find(|l| l.is_active)
+                .or_else(|| gpu.links.first());
+            match aggregate_link {
+                Some(link) => {
+                    let prev_link =
+                        prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+                    let curr_tx = link.tx_bytes.unwrap_or(0);
+                    let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
+                    let curr_rx = link.rx_bytes.unwrap_or(0);
+                    let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
+                    (
+                        curr_tx.saturating_sub(prev_tx),
+                        curr_rx.saturating_sub(prev_rx),
+                    )
+                }
+                None => (0, 0),
             }
-            None => (0, 0),
         };
+
+        // Compute individual link rates in bytes per second to store in the metadata links
+        let mut links = Vec::with_capacity(gpu.links.len());
+        for link in &gpu.links {
+            let prev_link =
+                prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+            let curr_tx = link.tx_bytes.unwrap_or(0);
+            let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
+            let curr_rx = link.rx_bytes.unwrap_or(0);
+            let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
+
+            let rate_tx = (curr_tx.saturating_sub(prev_tx) as f64 / elapsed) as u64;
+            let rate_rx = (curr_rx.saturating_sub(prev_rx) as f64 / elapsed) as u64;
+
+            let mut link_clone = link.clone();
+            link_clone.tx_bytes = Some(rate_tx);
+            link_clone.rx_bytes = Some(rate_rx);
+            links.push(link_clone);
+        }
 
         for link in &gpu.links {
             let prev_link =
@@ -1003,7 +1031,7 @@ fn compute_nvlink_throughputs(
                 gpu_index: gpu.gpu_index,
                 gpu_name: gpu.gpu_name.clone(),
                 active_links: active,
-                links: gpu.links.clone(),
+                links,
             }),
         });
     }
@@ -1040,6 +1068,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
                 make_link(1, true, Some(500_000_000), Some(0)),
@@ -1050,6 +1080,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_500_000_000), Some(2_500_000_000)),
                 make_link(1, true, Some(700_000_000), Some(100_000_000)),
@@ -1123,6 +1155,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
                 make_link(1, true, Some(1_000_000_000), Some(2_000_000_000)),
@@ -1133,6 +1167,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_125_000_000), Some(2_125_000_000)),
                 make_link(1, true, Some(1_125_000_000), Some(2_125_000_000)),
@@ -1187,6 +1223,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, false, Some(0), Some(0)),
                 make_link(1, false, Some(0), Some(0)),
@@ -1197,6 +1235,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, false, Some(250_000_000), Some(125_000_000)),
                 make_link(1, false, Some(999_999_999), Some(999_999_999)),
@@ -1224,6 +1264,8 @@ mod nvlink_tests {
             gpu_name: "A100".to_string(),
             link_count: 1,
             link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(0, true, Some(2_000_000_000), Some(1_000_000_000))],
         }];
 
@@ -1251,6 +1293,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 2,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: links_first.clone(),
         }];
         let curr_first = vec![NvLinkSnapshot {
@@ -1258,6 +1302,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_500_000_000), Some(2_500_000_000)),
                 make_link(1, true, Some(700_000_000), Some(350_000_000)),
@@ -1280,6 +1326,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(2_000_000_000), Some(3_000_000_000)),
                 make_link(1, true, Some(900_000_000), Some(450_000_000)),
@@ -1317,6 +1365,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 1,
             link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(0, true, Some(0), Some(0))],
         }];
         let curr = vec![NvLinkSnapshot {
@@ -1324,6 +1374,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 1,
             link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(0, true, Some(1_000_000_000), Some(500_000_000))],
         }];
 
@@ -1360,6 +1412,8 @@ mod nvlink_tests {
             gpu_name: "B200".to_string(),
             link_count: 1,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(
                 0,
                 true,
@@ -1372,6 +1426,8 @@ mod nvlink_tests {
             gpu_name: "B200".to_string(),
             link_count: 1,
             link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(0, true, Some(1_000), Some(2_000))],
         }];
 
@@ -1396,6 +1452,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![make_link(0, true, Some(0), Some(0))],
         }];
         let curr_a = vec![NvLinkSnapshot {
@@ -1403,6 +1461,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
                 make_link(1, true, Some(500_000_000), Some(250_000_000)),
@@ -1420,6 +1480,8 @@ mod nvlink_tests {
             gpu_name: "H100".to_string(),
             link_count: 3,
             link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
             links: vec![
                 make_link(0, true, Some(2_000_000_000), Some(3_000_000_000)),
                 make_link(1, true, Some(900_000_000), Some(450_000_000)),
@@ -1447,6 +1509,57 @@ mod nvlink_tests {
         assert_eq!(avg.port, 3, "averaged row must use latest sample's port");
         assert_eq!(avg.link_gbps, Some(150.0));
         assert_eq!(avg.dev_name, "nvidia0");
+    }
+
+    #[test]
+    fn aggregates_uses_gpu_wide_fields_when_present() {
+        let elapsed = 1.0_f64;
+
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: Some(10_000_000_000),
+            rx_bytes: Some(20_000_000_000),
+            links: vec![
+                make_link(0, true, Some(0), Some(0)),
+                make_link(1, true, Some(0), Some(0)),
+            ],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: Some(15_000_000_000),
+            rx_bytes: Some(25_000_000_000),
+            links: vec![
+                make_link(0, true, Some(100_000), Some(200_000)), // These are lane rates, shouldn't be used for aggregate
+                make_link(1, true, Some(300_000), Some(400_000)),
+            ],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Aggregate should be:
+        // tx = 15e9 - 10e9 = 5e9 bytes/sec -> 40 Gbps
+        // rx = 25e9 - 20e9 = 5e9 bytes/sec -> 40 Gbps
+        let expected_tx_gbps = 5_000_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        let expected_rx_gbps = 5_000_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!((row.tx_gbps - expected_tx_gbps).abs() < 1e-6);
+        assert!((row.rx_gbps - expected_rx_gbps).abs() < 1e-6);
+
+        // However, individual lanes should show the lane-specific rates (calculated from lane deltas):
+        // lane 0 tx: (100_000 - 0) / 1.0 = 100_000 bytes/sec
+        // lane 0 rx: (200_000 - 0) / 1.0 = 200_000 bytes/sec
+        let nv = row.nvlink.as_ref().unwrap();
+        assert_eq!(nv.links[0].tx_bytes, Some(100_000));
+        assert_eq!(nv.links[0].rx_bytes, Some(200_000));
+        assert_eq!(nv.links[1].tx_bytes, Some(300_000));
+        assert_eq!(nv.links[1].rx_bytes, Some(400_000));
     }
 
     #[test]

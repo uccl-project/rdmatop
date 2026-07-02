@@ -525,7 +525,7 @@ fn build_nvlink_detail_lines(
     // Muted note explaining that the per-lane TX/RX columns below show the
     // GPU-wide aggregate, since NVML does not expose per-lane throughput.
     lines.push(Line::from(styled(
-        " Per-lane throughput is not available from NVML; TX/RX values below are the GPU aggregate.",
+        " Per-lane throughput is not available from NVML on some drivers; values below show either per-lane rate or the GPU aggregate.",
         tc.muted,
         false,
     )));
@@ -537,12 +537,18 @@ fn build_nvlink_detail_lines(
         true,
     )]));
 
-    // One row per link (active + inactive). NVML does not expose per-lane
-    // throughput, so each lane row shows the same GPU-wide aggregate rate
-    // (converted from Gbps to MB/s via Gbps * 1000 / 8).
-    let tx_mb_s = t.tx_gbps * 1000.0 / 8.0;
-    let rx_mb_s = t.rx_gbps * 1000.0 / 8.0;
+    // One row per link (active + inactive). Render per-lane throughput if available,
+    // otherwise fallback to the GPU aggregate rate (converted from Gbps to MB/s).
     for link in &meta.links {
+        let link_tx_mb_s = match link.tx_bytes {
+            Some(bytes) => bytes as f64 / 1_000_000.0,
+            None => t.tx_gbps * 1000.0 / 8.0,
+        };
+        let link_rx_mb_s = match link.rx_bytes {
+            Some(bytes) => bytes as f64 / 1_000_000.0,
+            None => t.rx_gbps * 1000.0 / 8.0,
+        };
+
         let state_label = if link.is_active {
             "enabled"
         } else {
@@ -564,8 +570,8 @@ fn build_nvlink_detail_lines(
             styled(&format!(" {:>4}", link.link_id), tc.accent, false),
             styled(&format!("  {:<8}", state_label), state_color, false),
             styled(&format!("  {:>3}", ver_label), tc.fg, false),
-            styled(&format!("  {:>6.1}", tx_mb_s), tc.fg, false),
-            styled(&format!("  {:>6.1}", rx_mb_s), tc.fg, false),
+            styled(&format!("  {:>6.1}", link_tx_mb_s), tc.fg, false),
+            styled(&format!("  {:>6.1}", link_rx_mb_s), tc.fg, false),
             styled(&format!("  {}", remote_label), tc.muted, false),
         ]));
     }
@@ -1470,5 +1476,75 @@ mod nvlink_detail_tests {
             occurrences, 3,
             "expected the aggregate MB/s value in 3 lane rows, got {occurrences}"
         );
+    }
+
+    #[test]
+    fn lanes_show_per_lane_rates_when_present() {
+        let links = vec![
+            make_link(
+                0,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                Some(10_000_000), // 10 MB/s
+                Some(20_000_000), // 20 MB/s
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                1,
+                true,
+                RemoteDeviceType::Gpu,
+                Some("0000:02:00.0"),
+                Some(30_000_000), // 30 MB/s
+                Some(40_000_000), // 40 MB/s
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+        ];
+        let meta = NvLinkThroughputMeta {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            active_links: 2,
+            links: links.clone(),
+        };
+        let port = PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 2,
+            link_gbps: Some(100.0),
+            tx_gbps: 1.0,
+            rx_gbps: 1.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: Some("2/2".to_string()),
+            nvlink: Some(meta.clone()),
+        };
+
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+
+        // lane 0 row should contain "  10.0" and "  20.0"
+        let lane0_row = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("    0 "))
+            .unwrap()
+            .to_string();
+        assert!(lane0_row.contains("  10.0"), "lane 0 missing TX: {lane0_row:?}");
+        assert!(lane0_row.contains("  20.0"), "lane 0 missing RX: {lane0_row:?}");
+
+        // lane 1 row should contain "  30.0" and "  40.0"
+        let lane1_row = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("    1 "))
+            .unwrap()
+            .to_string();
+        assert!(lane1_row.contains("  30.0"), "lane 1 missing TX: {lane1_row:?}");
+        assert!(lane1_row.contains("  40.0"), "lane 1 missing RX: {lane1_row:?}");
     }
 }
