@@ -161,10 +161,7 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
         let nvlink = device.link_wrapper_for(link_id);
         let is_active = nvlink.is_active().unwrap_or(false);
         let version = nvlink.version().ok();
-        let remote_device_type = nvlink
-            .remote_device_type(link_id)
-            .map(RemoteDeviceType::from)
-            .unwrap_or(RemoteDeviceType::Unknown);
+        let remote_device_type = read_remote_device_type(nvml, &device, link_id);
         let remote_pci_bdf = nvlink.remote_pci_info().ok().map(|p| p.bus_id);
         let crc_error_count = nvlink.error_counter(ErrorCounter::DlCrcFlit).ok();
         let replay_error_count = nvlink.error_counter(ErrorCounter::DlReplay).ok();
@@ -308,6 +305,36 @@ fn read_link_throughput(
         None
     };
     (tx_bytes, rx_bytes)
+}
+
+#[allow(non_upper_case_globals)]
+fn read_remote_device_type(
+    nvml: &Nvml,
+    device: &nvml_wrapper::Device<'_>,
+    link: u32,
+) -> RemoteDeviceType {
+    use nvml_wrapper_sys::bindings::{
+        nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_GPU,
+        nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_IBMNPU,
+        nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_SWITCH, nvmlIntNvLinkDeviceType_t,
+    };
+
+    let mut dev_type: nvmlIntNvLinkDeviceType_t = 255;
+    let rc = unsafe {
+        nvml.lib()
+            .nvmlDeviceGetNvLinkRemoteDeviceType(device.handle(), link, &mut dev_type)
+    };
+
+    if rc == 0 {
+        match dev_type {
+            nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_GPU => RemoteDeviceType::Gpu,
+            nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_IBMNPU => RemoteDeviceType::IbmNpu,
+            nvmlIntNvLinkDeviceType_enum_NVML_NVLINK_DEVICE_TYPE_SWITCH => RemoteDeviceType::Switch,
+            _ => RemoteDeviceType::Unknown,
+        }
+    } else {
+        RemoteDeviceType::Unknown
+    }
 }
 
 #[cfg(test)]
