@@ -433,6 +433,10 @@ impl App {
             self.prev_nvlink = curr_nvlink;
         }
 
+        // Stable display order: sort once here so history, rolling averages,
+        // recording, and the display all inherit the same order.
+        sort_by_device_order(&mut self.throughputs);
+
         let curr_if = net::read_all_ifstats().unwrap_or_default();
         let net_rate = net::compute_net_rate(&self.prev_ifstats, &curr_if, elapsed);
         self.prev_ifstats = curr_if;
@@ -884,6 +888,14 @@ fn throughput_key(t: &PortThroughput) -> String {
         return t.dev_name.clone();
     }
     format!("{}/{}", t.dev_name, t.port)
+}
+
+/// Sort rows by device name (natural order), then port, for a stable display.
+/// Natural order compares each numeric run by value, so `mlx5_2` < `mlx5_10`.
+fn sort_by_device_order(throughputs: &mut [PortThroughput]) {
+    throughputs.sort_by(|a, b| {
+        alphanumeric_sort::compare_str(&a.dev_name, &b.dev_name).then(a.port.cmp(&b.port))
+    });
 }
 
 /// Sort averaged throughputs to match the order of the reference (instant) throughputs,
@@ -1682,5 +1694,60 @@ mod nvlink_tests {
         // Sanity: the NVLink row's resolved index in the reference equals the
         // original reference position, confirming the key match.
         let _ = nvlink_ref_pos;
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    fn row(dev_name: &str, port: u32) -> PortThroughput {
+        PortThroughput {
+            dev_name: dev_name.to_string(),
+            port,
+            link_gbps: None,
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+        }
+    }
+
+    fn names(rows: &[PortThroughput]) -> Vec<(String, u32)> {
+        rows.iter().map(|t| (t.dev_name.clone(), t.port)).collect()
+    }
+
+    #[test]
+    fn sort_by_device_order_sorts_index_numerically_not_lexically() {
+        // The whole point of natural order: mlx5_2 must precede mlx5_10.
+        let mut rows = vec![row("mlx5_10", 1), row("mlx5_2", 1), row("mlx5_9", 1)];
+        sort_by_device_order(&mut rows);
+        let sorted: Vec<_> = rows.iter().map(|t| t.dev_name.clone()).collect();
+        assert_eq!(sorted, vec!["mlx5_2", "mlx5_9", "mlx5_10"]);
+    }
+
+    #[test]
+    fn sort_by_device_order_orders_by_name_then_port() {
+        let mut rows = vec![
+            row("mlx5_10", 1),
+            row("mlx5_2", 2),
+            row("mlx5_2", 1),
+            row("bnxt_0", 1),
+        ];
+        sort_by_device_order(&mut rows);
+        assert_eq!(
+            names(&rows),
+            vec![
+                ("bnxt_0".to_string(), 1),
+                ("mlx5_2".to_string(), 1),
+                ("mlx5_2".to_string(), 2),
+                ("mlx5_10".to_string(), 1),
+            ]
+        );
     }
 }
