@@ -1535,8 +1535,14 @@ mod nvlink_detail_tests {
             .find(|l| l.to_string().starts_with("    0 "))
             .unwrap()
             .to_string();
-        assert!(lane0_row.contains("  10.0"), "lane 0 missing TX: {lane0_row:?}");
-        assert!(lane0_row.contains("  20.0"), "lane 0 missing RX: {lane0_row:?}");
+        assert!(
+            lane0_row.contains("  10.0"),
+            "lane 0 missing TX: {lane0_row:?}"
+        );
+        assert!(
+            lane0_row.contains("  20.0"),
+            "lane 0 missing RX: {lane0_row:?}"
+        );
 
         // lane 1 row should contain "  30.0" and "  40.0"
         let lane1_row = lines
@@ -1544,7 +1550,13 @@ mod nvlink_detail_tests {
             .find(|l| l.to_string().starts_with("    1 "))
             .unwrap()
             .to_string();
-        assert!(lane1_row.contains("  30.0"), "lane 1 missing TX: {lane1_row:?}");
-        assert!(lane1_row.contains("  40.0"), "lane 1 missing RX: {lane1_row:?}");
+        assert!(
+            lane1_row.contains("  30.0"),
+            "lane 1 missing TX: {lane1_row:?}"
+        );
+        assert!(
+            lane1_row.contains("  40.0"),
+            "lane 1 missing RX: {lane1_row:?}"
+        );
     }
 }
