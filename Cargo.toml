@@ -22,6 +22,7 @@ assets = [
 ]
 
 [dependencies]
+alphanumeric-sort = "1.5"
 libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
