@@ -230,7 +230,10 @@ fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
 fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
     match col {
         TableColumn::Device => Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
-        TableColumn::Port => Cell::from(t.port.to_string()).style(Style::default().fg(tc.muted)),
+        TableColumn::Port => {
+            let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
+            Cell::from(port_text).style(Style::default().fg(tc.muted))
+        }
         TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
             .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
@@ -460,6 +463,142 @@ fn build_detail_lines(
     lines
 }
 
+/// Build the per-lane detail panel for a NVLink GPU row.
+///
+/// Layout:
+///   Device: nvidiaN  [NVLink]  active/total active
+///   TX/RX aggregate Gbps with sparkline
+///   Lane table header (Lane, State, Ver, TX MB/s, RX MB/s, Remote)
+///   One row per link, including inactive lanes
+///   Summed error counters (replay/recovery/crc)
+#[cfg(feature = "nvlink")]
+fn build_nvlink_detail_lines(
+    t: &PortThroughput,
+    meta: &super::app::NvLinkThroughputMeta,
+    history: Option<&super::app::DeviceHistory>,
+    tc: &ThemeColors,
+    show_avg: bool,
+    avg_window: usize,
+) -> Vec<Line<'static>> {
+    let spark_w = 30;
+    let (tx_spark, rx_spark) = match history {
+        Some(h) => (sparkline_str(&h.tx, spark_w), sparkline_str(&h.rx, spark_w)),
+        None => (" ".repeat(spark_w), " ".repeat(spark_w)),
+    };
+    let avg_label = if show_avg {
+        format!("  [avg {}s]", avg_window)
+    } else {
+        String::new()
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header: Device: nvidiaN  [NVLink]  active/total active
+    lines.push(Line::from(vec![
+        styled(" Device: ", tc.muted, false),
+        styled(&t.dev_name, tc.accent, true),
+        styled("  [NVLink]  ", tc.accent, false),
+        styled(
+            &format!("{}/{} active", meta.active_links, meta.links.len()),
+            tc.fg,
+            false,
+        ),
+        styled(&avg_label, tc.accent, false),
+    ]));
+
+    // Aggregate TX line with sparkline.
+    lines.push(Line::from(vec![
+        styled(" TX: ", tc.muted, false),
+        styled(&format!("{:.2} Gbps ", t.tx_gbps), tc.good, false),
+        styled(&tx_spark, tc.good, false),
+    ]));
+
+    // Aggregate RX line with sparkline.
+    lines.push(Line::from(vec![
+        styled(" RX: ", tc.muted, false),
+        styled(&format!("{:.2} Gbps ", t.rx_gbps), tc.accent, false),
+        styled(&rx_spark, tc.accent, false),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Muted note explaining that the per-lane TX/RX columns below show the
+    // GPU-wide aggregate, since NVML does not expose per-lane throughput.
+    lines.push(Line::from(styled(
+        " Per-lane throughput is not available from NVML on some drivers; values below show either per-lane rate or the GPU aggregate.",
+        tc.muted,
+        false,
+    )));
+
+    // Lane table header.
+    lines.push(Line::from(vec![styled(
+        " Lane  State     Ver   TX MB/s   RX MB/s  Remote",
+        tc.header_fg,
+        true,
+    )]));
+
+    // One row per link (active + inactive). Render per-lane throughput if available,
+    // otherwise fallback to the GPU aggregate rate (converted from Gbps to MB/s).
+    for link in &meta.links {
+        let link_tx_mb_s = match link.tx_bytes {
+            Some(bytes) => bytes as f64 / 1_000_000.0,
+            None => t.tx_gbps * 1000.0 / 8.0,
+        };
+        let link_rx_mb_s = match link.rx_bytes {
+            Some(bytes) => bytes as f64 / 1_000_000.0,
+            None => t.rx_gbps * 1000.0 / 8.0,
+        };
+
+        let state_label = if link.is_active {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let state_color = if link.is_active { tc.good } else { tc.muted };
+        let ver_label = link
+            .version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let remote_label = match (&link.remote_pci_bdf, &link.remote_device_type) {
+            (Some(bdf), ty) => format!("{} {}", ty.label(), bdf),
+            (None, ty) => match ty {
+                crate::nvlink::RemoteDeviceType::Unknown => "-".to_string(),
+                _ => ty.label().to_string(),
+            },
+        };
+        lines.push(Line::from(vec![
+            styled(&format!(" {:>4}", link.link_id), tc.accent, false),
+            styled(&format!("  {:<8}", state_label), state_color, false),
+            styled(&format!("  {:>3}", ver_label), tc.fg, false),
+            styled(&format!("  {:>6.1}", link_tx_mb_s), tc.fg, false),
+            styled(&format!("  {:>6.1}", link_rx_mb_s), tc.fg, false),
+            styled(&format!("  {}", remote_label), tc.muted, false),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // Errors line: sum per-link counters across all lanes. None -> 0.
+    let mut crc: u64 = 0;
+    let mut replay: u64 = 0;
+    let mut recovery: u64 = 0;
+    for link in &meta.links {
+        crc = crc.saturating_add(link.crc_error_count.unwrap_or(0));
+        replay = replay.saturating_add(link.replay_error_count.unwrap_or(0));
+        recovery = recovery.saturating_add(link.recovery_error_count.unwrap_or(0));
+    }
+    lines.push(Line::from(vec![
+        styled(" Errors: ", tc.muted, false),
+        styled(&format!("replay={}", replay), tc.warning, false),
+        styled("  ", tc.muted, false),
+        styled(&format!("recovery={}", recovery), tc.warning, false),
+        styled("  ", tc.muted, false),
+        styled(&format!("crc={}", crc), tc.warning, false),
+    ]));
+
+    lines
+}
+
 fn build_device_header(
     t: &PortThroughput,
     history: Option<&super::app::DeviceHistory>,
@@ -584,6 +723,29 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let history = app.history.get(&t.dev_name);
     let procs = app.selected_device_processes();
+
+    #[cfg(feature = "nvlink")]
+    let lines = if let Some(ref meta) = t.nvlink {
+        build_nvlink_detail_lines(
+            &t,
+            meta,
+            history,
+            tc,
+            app.show_rolling_avg,
+            app.rolling_avg.window_secs,
+        )
+    } else {
+        build_detail_lines(
+            &t,
+            &procs,
+            history,
+            tc,
+            app.show_rolling_avg,
+            app.rolling_avg.window_secs,
+        )
+    };
+
+    #[cfg(not(feature = "nvlink"))]
     let lines = build_detail_lines(
         &t,
         &procs,
@@ -878,5 +1040,523 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max - 1])
+    }
+}
+
+#[cfg(all(test, feature = "nvlink"))]
+mod nvlink_detail_tests {
+    use super::*;
+    use crate::nvlink::{LinkSnapshot, RemoteDeviceType};
+    use crate::tui::app::{CounterRate, NvLinkThroughputMeta};
+    use crate::tui::theme::Theme;
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_link(
+        id: u32,
+        active: bool,
+        remote_type: RemoteDeviceType,
+        remote_bdf: Option<&str>,
+        tx_bytes: Option<u64>,
+        rx_bytes: Option<u64>,
+        crc: Option<u64>,
+        replay: Option<u64>,
+        recovery: Option<u64>,
+        version: Option<u32>,
+    ) -> LinkSnapshot {
+        LinkSnapshot {
+            link_id: id,
+            is_active: active,
+            version,
+            speed_gbps: if active { Some(50.0) } else { None },
+            remote_device_type: remote_type,
+            remote_pci_bdf: remote_bdf.map(|s| s.to_string()),
+            tx_bytes,
+            rx_bytes,
+            crc_error_count: crc,
+            replay_error_count: replay,
+            recovery_error_count: recovery,
+        }
+    }
+
+    /// Build a synthetic `PortThroughput` whose `counter_rates` contain one
+    /// `nvlink_tx_l<N>` / `nvlink_rx_l<N>` pair per provided link, with the
+    /// supplied `tx_rate` / `rx_rate` (bytes/sec) values. Returned tuple is
+    /// `(PortThroughput, NvLinkThroughputMeta)` — they share the same `links`
+    /// list so the detail renderer sees a consistent view.
+    fn make_port(
+        dev_name: &str,
+        links: Vec<LinkSnapshot>,
+        tx_rate_bps: f64,
+        rx_rate_bps: f64,
+    ) -> (PortThroughput, NvLinkThroughputMeta) {
+        let counter_rates: Vec<CounterRate> = links
+            .iter()
+            .flat_map(|l| {
+                vec![
+                    CounterRate {
+                        name: format!("nvlink_tx_l{}", l.link_id),
+                        value: l.tx_bytes.unwrap_or(0),
+                        delta: 0,
+                        rate: tx_rate_bps,
+                        is_bytes: true,
+                    },
+                    CounterRate {
+                        name: format!("nvlink_rx_l{}", l.link_id),
+                        value: l.rx_bytes.unwrap_or(0),
+                        delta: 0,
+                        rate: rx_rate_bps,
+                        is_bytes: true,
+                    },
+                ]
+            })
+            .collect();
+        let active = links.iter().filter(|l| l.is_active).count() as u32;
+        let meta = NvLinkThroughputMeta {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            active_links: active,
+            links: links.clone(),
+        };
+        let port = PortThroughput {
+            dev_name: dev_name.to_string(),
+            port: active,
+            link_gbps: Some(50.0),
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates,
+            port_label: Some(format!("{}/{}", active, links.len())),
+            nvlink: Some(meta.clone()),
+        };
+        (port, meta)
+    }
+
+    fn join_lines(lines: &[Line<'static>]) -> String {
+        let mut s = String::new();
+        for line in lines {
+            s.push_str(&line.to_string());
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn header_contains_device_and_active_count() {
+        let links = vec![
+            make_link(
+                0,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                1,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                2,
+                false,
+                RemoteDeviceType::Unknown,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let (port, meta) = make_port("nvidia0", links, 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let header = lines[0].to_string();
+        assert!(
+            header.contains("Device: nvidia0"),
+            "header missing device label: {header:?}"
+        );
+        assert!(
+            header.contains("[NVLink]"),
+            "header missing NVLink tag: {header:?}"
+        );
+        assert!(
+            header.contains("2/3 active"),
+            "header missing active/total count: {header:?}"
+        );
+        // No avg label when show_avg=false.
+        assert!(
+            !header.contains("[avg"),
+            "avg label should be hidden: {header:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_link_renders_disabled_and_dash_remote() {
+        let links = vec![make_link(
+            0,
+            false,
+            RemoteDeviceType::Unknown,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )];
+        let (port, meta) = make_port("nvidia0", links, 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let blob = join_lines(&lines);
+        assert!(blob.contains("disabled"), "missing 'disabled': {blob}");
+        // Remote label column for Unknown remote with no BDF should be "-".
+        // The row layout puts the remote label at the end; check it ends with "  -".
+        let lane_row = lines
+            .iter()
+            .find(|l| l.to_string().contains("disabled"))
+            .expect("lane row with disabled");
+        let s = lane_row.to_string();
+        assert!(
+            s.trim_end().ends_with('-'),
+            "inactive row should end with '-': {s:?}"
+        );
+    }
+
+    #[test]
+    fn active_link_renders_remote_pci_bdf() {
+        let links = vec![make_link(
+            2,
+            true,
+            RemoteDeviceType::Switch,
+            Some("0000:01:00.0"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+        )];
+        let (port, meta) = make_port("nvidia0", links, 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let blob = join_lines(&lines);
+        assert!(
+            blob.contains("NVSwitch 0000:01:00.0"),
+            "active switch link missing remote label: {blob}"
+        );
+        assert!(
+            blob.contains("enabled"),
+            "active link row should be 'enabled': {blob}"
+        );
+    }
+
+    #[test]
+    fn error_line_sums_counters_across_links() {
+        let links = vec![
+            make_link(
+                0,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                None,
+                None,
+                Some(3),
+                Some(5),
+                Some(2),
+                Some(4),
+            ),
+            make_link(
+                1,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                None,
+                None,
+                Some(7),
+                Some(11),
+                Some(13),
+                Some(4),
+            ),
+            make_link(
+                2,
+                false,
+                RemoteDeviceType::Unknown,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let (port, meta) = make_port("nvidia0", links, 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let error_line = lines
+            .iter()
+            .find(|l| l.to_string().contains("Errors:"))
+            .expect("Errors line")
+            .to_string();
+        // crc = 3 + 7 = 10 (link 2 contributes 0)
+        assert!(
+            error_line.contains("crc=10"),
+            "crc sum wrong: {error_line:?}"
+        );
+        // replay = 5 + 11 = 16
+        assert!(
+            error_line.contains("replay=16"),
+            "replay sum wrong: {error_line:?}"
+        );
+        // recovery = 2 + 13 = 15
+        assert!(
+            error_line.contains("recovery=15"),
+            "recovery sum wrong: {error_line:?}"
+        );
+    }
+
+    #[test]
+    fn rolling_average_label_appears_when_enabled() {
+        let links = vec![make_link(
+            0,
+            true,
+            RemoteDeviceType::Switch,
+            Some("0000:01:00.0"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+        )];
+        let (port, meta) = make_port("nvidia0", links, 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, true, 5);
+        let header = lines[0].to_string();
+        assert!(
+            header.contains("[avg 5s]"),
+            "rolling avg label missing: {header:?}"
+        );
+    }
+
+    #[test]
+    fn header_and_lanes_show_aggregate_rates() {
+        // Two active links and one inactive link. The aggregate must appear
+        // in the header (in Gbps) and be repeated identically in every lane
+        // row (in MB/s) — NVML does not expose per-lane throughput.
+        let links = vec![
+            make_link(
+                0,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                1,
+                true,
+                RemoteDeviceType::Gpu,
+                Some("0000:02:00.0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                2,
+                false,
+                RemoteDeviceType::Unknown,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        // Build a PortThroughput with non-zero aggregate rates. `make_port`
+        // hardcodes the aggregate to 0.0, so construct it inline.
+        let meta = NvLinkThroughputMeta {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            active_links: 2,
+            links: links.clone(),
+        };
+        let port = PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 2,
+            link_gbps: Some(100.0),
+            tx_gbps: 1.0,
+            rx_gbps: 1.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: Some("2/3".to_string()),
+            nvlink: Some(meta.clone()),
+        };
+
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+
+        // Header aggregate lines must contain the Gbps string.
+        let tx_line = lines[1].to_string();
+        let rx_line = lines[2].to_string();
+        assert!(
+            tx_line.contains("1.00 Gbps"),
+            "TX header missing aggregate rate: {tx_line:?}"
+        );
+        assert!(
+            rx_line.contains("1.00 Gbps"),
+            "RX header missing aggregate rate: {rx_line:?}"
+        );
+
+        // Compute the expected MB/s value: gbps * 1000 / 8 = 125.0.
+        let expected_mb_s = "125.0";
+
+        // Muted note line must be present before the lane table.
+        let blob = join_lines(&lines);
+        assert!(
+            blob.contains("Per-lane throughput is not available from NVML"),
+            "missing muted note about per-lane throughput: {blob}"
+        );
+
+        // Each lane row must contain the aggregate MB/s value. Look up rows
+        // by their link id and verify both TX and RX columns render 125.0.
+        for link in &links {
+            let lane_row = lines
+                .iter()
+                .find(|l| {
+                    let s = l.to_string();
+                    s.contains(&format!("{:>4}", link.link_id))
+                })
+                .unwrap_or_else(|| panic!("missing lane row for link {}", link.link_id))
+                .to_string();
+            // The MB/s value is rendered as `{:>6.1}` so it appears as
+            // " 125.0" (leading space from the width spec).
+            assert!(
+                lane_row.contains(&format!("{}", expected_mb_s)),
+                "lane {} row missing aggregate MB/s value {}: {:?}",
+                link.link_id,
+                expected_mb_s,
+                lane_row
+            );
+        }
+
+        // The MB/s value must appear in every lane row — that's three
+        // occurrences total (one per link).
+        let occurrences = lines
+            .iter()
+            .filter(|l| l.to_string().contains(expected_mb_s))
+            .count();
+        assert_eq!(
+            occurrences, 3,
+            "expected the aggregate MB/s value in 3 lane rows, got {occurrences}"
+        );
+    }
+
+    #[test]
+    fn lanes_show_per_lane_rates_when_present() {
+        let links = vec![
+            make_link(
+                0,
+                true,
+                RemoteDeviceType::Switch,
+                Some("0000:01:00.0"),
+                Some(10_000_000), // 10 MB/s
+                Some(20_000_000), // 20 MB/s
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            make_link(
+                1,
+                true,
+                RemoteDeviceType::Gpu,
+                Some("0000:02:00.0"),
+                Some(30_000_000), // 30 MB/s
+                Some(40_000_000), // 40 MB/s
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+        ];
+        let meta = NvLinkThroughputMeta {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            active_links: 2,
+            links: links.clone(),
+        };
+        let port = PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 2,
+            link_gbps: Some(100.0),
+            tx_gbps: 1.0,
+            rx_gbps: 1.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: Some("2/2".to_string()),
+            nvlink: Some(meta.clone()),
+        };
+
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+
+        // lane 0 row should contain "  10.0" and "  20.0"
+        let lane0_row = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("    0 "))
+            .unwrap()
+            .to_string();
+        assert!(
+            lane0_row.contains("  10.0"),
+            "lane 0 missing TX: {lane0_row:?}"
+        );
+        assert!(
+            lane0_row.contains("  20.0"),
+            "lane 0 missing RX: {lane0_row:?}"
+        );
+
+        // lane 1 row should contain "  30.0" and "  40.0"
+        let lane1_row = lines
+            .iter()
+            .find(|l| l.to_string().starts_with("    1 "))
+            .unwrap()
+            .to_string();
+        assert!(
+            lane1_row.contains("  30.0"),
+            "lane 1 missing TX: {lane1_row:?}"
+        );
+        assert!(
+            lane1_row.contains("  40.0"),
+            "lane 1 missing RX: {lane1_row:?}"
+        );
     }
 }

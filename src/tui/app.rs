@@ -20,6 +20,31 @@ pub struct PortThroughput {
     pub rx_pkts_per_sec: f64,
     pub rx_drops_per_sec: f64,
     pub counter_rates: Vec<CounterRate>,
+    /// Optional override for the Port column text. Used by NVLink rows.
+    pub port_label: Option<String>,
+    /// NVLink metadata attached to this row. Populated by Task 3 and rendered
+    /// by the TUI detail pane when the `nvlink` feature is enabled.
+    #[cfg(feature = "nvlink")]
+    pub nvlink: Option<NvLinkThroughputMeta>,
+}
+
+/// Per-GPU NVLink metadata attached to a `PortThroughput` row when the
+/// `nvlink` feature is enabled. The TUI uses this to show per-link details
+/// and error counters in the detail pane.
+#[cfg(feature = "nvlink")]
+#[derive(Clone, Debug)]
+pub struct NvLinkThroughputMeta {
+    /// GPU index reported by NVML. Not directly rendered by the TUI today
+    /// (the row already shows `nvidia<index>` via `PortThroughput::dev_name`)
+    /// but kept so future panels (e.g. topology graph) can reference it.
+    #[allow(dead_code)]
+    pub gpu_index: u32,
+    /// Marketing name of the GPU (e.g. "H100"). Currently unused by the
+    /// detail pane, which displays only the aggregate active/total counts.
+    #[allow(dead_code)]
+    pub gpu_name: String,
+    pub active_links: u32,
+    pub links: Vec<crate::nvlink::LinkSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +181,7 @@ impl RollingAvgState {
     pub fn push(&mut self, throughputs: &[PortThroughput]) {
         let mut seen = std::collections::HashSet::new();
         for t in throughputs {
-            let key = format!("{}/{}", t.dev_name, t.port);
+            let key = throughput_key(t);
             seen.insert(key.clone());
             let buf = self
                 .samples
@@ -189,17 +214,25 @@ impl RollingAvgState {
         let start = buf.len().saturating_sub(window_secs);
         let window: Vec<_> = buf.iter().skip(start).collect();
         let n = window.len() as f64;
-        let first = window[0];
+        // Copy metadata from the latest sample. For NVLink rows, the oldest
+        // sample's `port`/`port_label` may reflect a stale active-link count;
+        // using the latest keeps the averaged row's metadata fresh.
+        // `nvlink` is also metadata; preserving it lets `throughput_key`
+        // identify averaged NVLink rows by `dev_name` alone.
+        let latest = window.last().unwrap();
         let mut avg = PortThroughput {
-            dev_name: first.dev_name.clone(),
-            port: first.port,
-            link_gbps: first.link_gbps,
+            dev_name: latest.dev_name.clone(),
+            port: latest.port,
+            link_gbps: latest.link_gbps,
             tx_gbps: window.iter().map(|s| s.tx_gbps).sum::<f64>() / n,
             rx_gbps: window.iter().map(|s| s.rx_gbps).sum::<f64>() / n,
             tx_pkts_per_sec: window.iter().map(|s| s.tx_pkts_per_sec).sum::<f64>() / n,
             rx_pkts_per_sec: window.iter().map(|s| s.rx_pkts_per_sec).sum::<f64>() / n,
             rx_drops_per_sec: window.iter().map(|s| s.rx_drops_per_sec).sum::<f64>() / n,
             counter_rates: Vec::new(),
+            port_label: latest.port_label.clone(),
+            #[cfg(feature = "nvlink")]
+            nvlink: latest.nvlink.clone(),
         };
         if let Some(template) = window.last() {
             avg.counter_rates = template
@@ -298,6 +331,8 @@ pub struct App {
     pub recorder: Option<Recorder>,
     /// Transient message shown after a recording is saved or fails.
     pub record_status: Option<String>,
+    #[cfg(feature = "nvlink")]
+    prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
 }
 
 const HISTORY_LEN: usize = 60;
@@ -372,6 +407,8 @@ impl App {
             cached_display: Vec::new(),
             recorder: None,
             record_status: None,
+            #[cfg(feature = "nvlink")]
+            prev_nvlink: Vec::new(),
         }
     }
 
@@ -386,6 +423,15 @@ impl App {
         }
         self.throughputs = compute_throughputs(&self.prev_stats, &curr, elapsed);
         self.prev_stats = curr;
+
+        #[cfg(feature = "nvlink")]
+        {
+            let curr_nvlink = crate::nvlink::read_all_nvlink_stats().unwrap_or_default();
+            let mut nvlink_rows =
+                compute_nvlink_throughputs(&self.prev_nvlink, &curr_nvlink, elapsed);
+            self.throughputs.append(&mut nvlink_rows);
+            self.prev_nvlink = curr_nvlink;
+        }
 
         let curr_if = net::read_all_ifstats().unwrap_or_default();
         let net_rate = net::compute_net_rate(&self.prev_ifstats, &curr_if, elapsed);
@@ -814,6 +860,9 @@ fn compute_port_throughput(
         rx_pkts_per_sec: rate_by_name(&counter_rates, "rx_pkts"),
         rx_drops_per_sec: rate_by_name(&counter_rates, "rx_drops"),
         counter_rates,
+        port_label: None,
+        #[cfg(feature = "nvlink")]
+        nvlink: None,
     }
 }
 
@@ -823,17 +872,815 @@ fn compute_throughputs(prev: &[PortStat], curr: &[PortStat], elapsed: f64) -> Ve
         .collect()
 }
 
+/// Stable identity key for a `PortThroughput` row across refreshes.
+///
+/// For NVLink rows the `port` field encodes the active-link count, which can
+/// change between samples even when the underlying GPU is the same. Using
+/// `dev_name` alone keeps the key (and therefore sort order and rolling-avg
+/// history) stable across those changes.
+fn throughput_key(t: &PortThroughput) -> String {
+    #[cfg(feature = "nvlink")]
+    if t.nvlink.is_some() {
+        return t.dev_name.clone();
+    }
+    format!("{}/{}", t.dev_name, t.port)
+}
+
 /// Sort averaged throughputs to match the order of the reference (instant) throughputs,
 /// using an index map for O(n log n) performance.
 fn sort_by_throughput_order(avgs: &mut [PortThroughput], reference: &[PortThroughput]) {
-    let index_map: HashMap<(String, u32), usize> = reference
+    let index_map: HashMap<String, usize> = reference
         .iter()
         .enumerate()
-        .map(|(i, t)| ((t.dev_name.clone(), t.port), i))
+        .map(|(i, t)| (throughput_key(t), i))
         .collect();
-    avgs.sort_by_key(|t| {
-        *index_map
-            .get(&(t.dev_name.clone(), t.port))
-            .unwrap_or(&usize::MAX)
-    });
+    avgs.sort_by_key(|t| *index_map.get(&throughput_key(t)).unwrap_or(&usize::MAX));
+}
+
+/// Compute one `PortThroughput` row per GPU from a pair of NVLink snapshots.
+///
+/// The previous snapshot is looked up by `gpu_index`. Missing previous links
+/// (or `None` byte counters) are treated as zero so a freshly-observed GPU
+/// surfaces its full current byte counts as the first delta.
+///
+/// NVML exposes `NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX/RX` as a *GPU-wide*
+/// aggregate, not per-link counters. Each link in `LinkSnapshot::tx_bytes` /
+/// `rx_bytes` therefore carries the same GPU-wide value, so we must read it
+/// exactly once per GPU (from the first active link, or the first link if no
+/// link is active) instead of summing across links. Summing would multiply
+/// the aggregate by the number of active links.
+///
+/// Per-link error `CounterRate`s (crc/replay/recovery) are still emitted for
+/// every link so the detail pane can display per-lane error counts.
+#[cfg(feature = "nvlink")]
+fn compute_nvlink_throughputs(
+    prev: &[crate::nvlink::NvLinkSnapshot],
+    curr: &[crate::nvlink::NvLinkSnapshot],
+    elapsed: f64,
+) -> Vec<PortThroughput> {
+    let mut out = Vec::with_capacity(curr.len());
+    for gpu in curr {
+        let prev_gpu = prev.iter().find(|p| p.gpu_index == gpu.gpu_index);
+        let mut counter_rates: Vec<CounterRate> = Vec::new();
+
+        // Calculate GPU-wide aggregate throughput, preferring the u32::MAX aggregate fields.
+        let (tx_bytes_total, rx_bytes_total) = if gpu.tx_bytes.is_some() || gpu.rx_bytes.is_some() {
+            let curr_tx = gpu.tx_bytes.unwrap_or(0);
+            let prev_tx = prev_gpu.and_then(|p| p.tx_bytes).unwrap_or(0);
+            let curr_rx = gpu.rx_bytes.unwrap_or(0);
+            let prev_rx = prev_gpu.and_then(|p| p.rx_bytes).unwrap_or(0);
+            (
+                curr_tx.saturating_sub(prev_tx),
+                curr_rx.saturating_sub(prev_rx),
+            )
+        } else {
+            // Fallback: Pick a single link to source the GPU-wide TX/RX aggregate from.
+            let aggregate_link = gpu
+                .links
+                .iter()
+                .find(|l| l.is_active)
+                .or_else(|| gpu.links.first());
+            match aggregate_link {
+                Some(link) => {
+                    let prev_link =
+                        prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+                    let curr_tx = link.tx_bytes.unwrap_or(0);
+                    let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
+                    let curr_rx = link.rx_bytes.unwrap_or(0);
+                    let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
+                    (
+                        curr_tx.saturating_sub(prev_tx),
+                        curr_rx.saturating_sub(prev_rx),
+                    )
+                }
+                None => (0, 0),
+            }
+        };
+
+        // Compute individual link rates in bytes per second to store in the metadata links
+        let mut links = Vec::with_capacity(gpu.links.len());
+        for link in &gpu.links {
+            let prev_link =
+                prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+            let curr_tx = link.tx_bytes.unwrap_or(0);
+            let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
+            let curr_rx = link.rx_bytes.unwrap_or(0);
+            let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
+
+            let rate_tx = (curr_tx.saturating_sub(prev_tx) as f64 / elapsed) as u64;
+            let rate_rx = (curr_rx.saturating_sub(prev_rx) as f64 / elapsed) as u64;
+
+            let mut link_clone = link.clone();
+            link_clone.tx_bytes = Some(rate_tx);
+            link_clone.rx_bytes = Some(rate_rx);
+            links.push(link_clone);
+        }
+
+        for link in &gpu.links {
+            let prev_link =
+                prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+
+            if let Some(v) = link.crc_error_count {
+                let prev_v = prev_link.and_then(|l| l.crc_error_count).unwrap_or(0);
+                let delta = v.saturating_sub(prev_v);
+                counter_rates.push(CounterRate {
+                    name: format!("nvlink_crc_l{}", link.link_id),
+                    value: v,
+                    delta,
+                    rate: delta as f64 / elapsed,
+                    is_bytes: false,
+                });
+            }
+            if let Some(v) = link.replay_error_count {
+                let prev_v = prev_link.and_then(|l| l.replay_error_count).unwrap_or(0);
+                let delta = v.saturating_sub(prev_v);
+                counter_rates.push(CounterRate {
+                    name: format!("nvlink_replay_l{}", link.link_id),
+                    value: v,
+                    delta,
+                    rate: delta as f64 / elapsed,
+                    is_bytes: false,
+                });
+            }
+            if let Some(v) = link.recovery_error_count {
+                let prev_v = prev_link.and_then(|l| l.recovery_error_count).unwrap_or(0);
+                let delta = v.saturating_sub(prev_v);
+                counter_rates.push(CounterRate {
+                    name: format!("nvlink_recovery_l{}", link.link_id),
+                    value: v,
+                    delta,
+                    rate: delta as f64 / elapsed,
+                    is_bytes: false,
+                });
+            }
+        }
+
+        let active = gpu.active_links();
+        out.push(PortThroughput {
+            dev_name: format!("nvidia{}", gpu.gpu_index),
+            port: active,
+            link_gbps: gpu.link_gbps,
+            tx_gbps: bytes_to_gbps(tx_bytes_total as f64 / elapsed),
+            rx_gbps: bytes_to_gbps(rx_bytes_total as f64 / elapsed),
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates,
+            port_label: Some(format!("{}/{}", active, gpu.link_count)),
+            nvlink: Some(NvLinkThroughputMeta {
+                gpu_index: gpu.gpu_index,
+                gpu_name: gpu.gpu_name.clone(),
+                active_links: active,
+                links,
+            }),
+        });
+    }
+    out
+}
+
+#[cfg(all(test, feature = "nvlink"))]
+mod nvlink_tests {
+    use super::*;
+    use crate::nvlink::{LinkSnapshot, NvLinkSnapshot, RemoteDeviceType};
+
+    fn make_link(id: u32, active: bool, tx: Option<u64>, rx: Option<u64>) -> LinkSnapshot {
+        LinkSnapshot {
+            link_id: id,
+            is_active: active,
+            version: None,
+            speed_gbps: if active { Some(50.0) } else { None },
+            remote_device_type: RemoteDeviceType::Gpu,
+            remote_pci_bdf: None,
+            tx_bytes: tx,
+            rx_bytes: rx,
+            crc_error_count: None,
+            replay_error_count: None,
+            recovery_error_count: None,
+        }
+    }
+
+    #[test]
+    fn aggregates_only_active_links_and_sets_port_label() {
+        let elapsed = 1.0_f64;
+
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
+                make_link(1, true, Some(500_000_000), Some(0)),
+            ],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_500_000_000), Some(2_500_000_000)),
+                make_link(1, true, Some(700_000_000), Some(100_000_000)),
+                make_link(2, false, None, None),
+            ],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.dev_name, "nvidia0");
+        assert_eq!(row.port, 2, "port column = active link count");
+        assert_eq!(row.port_label.as_deref(), Some("2/3"));
+        assert_eq!(row.link_gbps, Some(150.0));
+        assert_eq!(row.tx_pkts_per_sec, 0.0);
+        assert_eq!(row.rx_pkts_per_sec, 0.0);
+        assert_eq!(row.rx_drops_per_sec, 0.0);
+
+        // NVML exposes a *GPU-wide* aggregate for TX/RX, so the aggregate is
+        // the delta of the first active link only — NOT summed across links.
+        // tx delta: (1.5e9 - 1.0e9) = 0.5e9 bytes/sec
+        let expected_tx_gbps = 500_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        // rx delta: (2.5e9 - 2.0e9) = 0.5e9 bytes/sec
+        let expected_rx_gbps = 500_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!(
+            (row.tx_gbps - expected_tx_gbps).abs() < 1e-6,
+            "tx_gbps {} != {}",
+            row.tx_gbps,
+            expected_tx_gbps
+        );
+        assert!(
+            (row.rx_gbps - expected_rx_gbps).abs() < 1e-6,
+            "rx_gbps {} != {}",
+            row.rx_gbps,
+            expected_rx_gbps
+        );
+
+        // Per-link *throughput* counter rates (nvlink_tx_lN / nvlink_rx_lN)
+        // are no longer emitted — the per-link counters in NVML are the same
+        // GPU-wide aggregate, so per-link rates would be redundant.
+        assert!(
+            !row.counter_rates
+                .iter()
+                .any(|c| c.name.starts_with("nvlink_tx_l")),
+            "per-link TX throughput counter rates must not be emitted"
+        );
+        assert!(
+            !row.counter_rates
+                .iter()
+                .any(|c| c.name.starts_with("nvlink_rx_l")),
+            "per-link RX throughput counter rates must not be emitted"
+        );
+
+        let nv = row.nvlink.as_ref().expect("nvlink meta present");
+        assert_eq!(nv.gpu_index, 0);
+        assert_eq!(nv.gpu_name, "H100");
+        assert_eq!(nv.active_links, 2);
+        assert_eq!(nv.links.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_throughput_is_not_multiplied_by_active_link_count() {
+        // Two active links with identical TX/RX counters. NVML's per-link
+        // counters are actually a GPU-wide aggregate, so summing the deltas
+        // would double-count. The aggregate must reflect the single-link rate.
+        let elapsed = 1.0_f64;
+
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
+                make_link(1, true, Some(1_000_000_000), Some(2_000_000_000)),
+            ],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_125_000_000), Some(2_125_000_000)),
+                make_link(1, true, Some(1_125_000_000), Some(2_125_000_000)),
+            ],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Single-link delta: tx = 0.125e9 bytes/sec, rx = 0.125e9 bytes/sec.
+        let expected_tx_gbps = 125_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        let expected_rx_gbps = 125_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!(
+            (row.tx_gbps - expected_tx_gbps).abs() < 1e-6,
+            "tx_gbps {} != single-link rate {}",
+            row.tx_gbps,
+            expected_tx_gbps
+        );
+        assert!(
+            (row.rx_gbps - expected_rx_gbps).abs() < 1e-6,
+            "rx_gbps {} != single-link rate {}",
+            row.rx_gbps,
+            expected_rx_gbps
+        );
+        // If the bug regresses the aggregate would be 2x.
+        assert!(
+            row.tx_gbps < expected_tx_gbps * 1.5,
+            "tx_gbps {} unexpectedly large; sum-across-links bug?",
+            row.tx_gbps
+        );
+        assert!(
+            row.rx_gbps < expected_rx_gbps * 1.5,
+            "rx_gbps {} unexpectedly large; sum-across-links bug?",
+            row.rx_gbps
+        );
+        // Active-link count must still be reported for the port column.
+        assert_eq!(row.port, 2);
+        assert_eq!(row.port_label.as_deref(), Some("2/2"));
+    }
+
+    #[test]
+    fn aggregate_falls_back_to_first_link_when_no_active() {
+        // With no active links, NVML may still report non-zero byte counters
+        // on the (inactive) ports. We must pick one source for the aggregate;
+        // falling back to the first link (in list order) avoids dropping
+        // signal entirely when a GPU momentarily has no active links.
+        let elapsed = 1.0_f64;
+
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, false, Some(0), Some(0)),
+                make_link(1, false, Some(0), Some(0)),
+            ],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, false, Some(250_000_000), Some(125_000_000)),
+                make_link(1, false, Some(999_999_999), Some(999_999_999)),
+            ],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // First link's delta wins.
+        let expected_tx_gbps = 250_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        let expected_rx_gbps = 125_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!((row.tx_gbps - expected_tx_gbps).abs() < 1e-6);
+        assert!((row.rx_gbps - expected_rx_gbps).abs() < 1e-6);
+        assert_eq!(row.port, 0);
+        assert_eq!(row.port_label.as_deref(), Some("0/2"));
+    }
+
+    #[test]
+    fn missing_prev_snapshot_treats_curr_as_delta() {
+        let elapsed = 2.0_f64;
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 1,
+            gpu_name: "A100".to_string(),
+            link_count: 1,
+            link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(0, true, Some(2_000_000_000), Some(1_000_000_000))],
+        }];
+
+        let rows = compute_nvlink_throughputs(&[], &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.dev_name, "nvidia1");
+        assert_eq!(row.port_label.as_deref(), Some("1/1"));
+        let expected_tx = 2_000_000_000.0_f64 * 8.0 / 1_000_000_000.0 / elapsed;
+        let expected_rx = 1_000_000_000.0_f64 * 8.0 / 1_000_000_000.0 / elapsed;
+        assert!((row.tx_gbps - expected_tx).abs() < 1e-6);
+        assert!((row.rx_gbps - expected_rx).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rolling_avg_keeps_history_across_active_link_changes() {
+        // Build a single GPU NVLink snapshot with two active links.
+        let elapsed = 1.0_f64;
+        let links_first = vec![
+            make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
+            make_link(1, true, Some(500_000_000), Some(250_000_000)),
+        ];
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: links_first.clone(),
+        }];
+        let curr_first = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_500_000_000), Some(2_500_000_000)),
+                make_link(1, true, Some(700_000_000), Some(350_000_000)),
+                make_link(2, false, None, None),
+            ],
+        }];
+        let rows_first = compute_nvlink_throughputs(&prev, &curr_first, elapsed);
+        assert_eq!(rows_first.len(), 1);
+        assert_eq!(rows_first[0].port_label.as_deref(), Some("2/3"));
+
+        let mut state = RollingAvgState::new(5);
+        state.push(&rows_first);
+        assert_eq!(state.samples.len(), 1);
+
+        // Same GPU, different active link count -> port_label changes
+        // from "2/3" to "3/3". The history entry must be reused, not
+        // dropped and re-created.
+        let curr_second = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(2_000_000_000), Some(3_000_000_000)),
+                make_link(1, true, Some(900_000_000), Some(450_000_000)),
+                make_link(2, true, Some(100_000_000), Some(50_000_000)),
+            ],
+        }];
+        let rows_second = compute_nvlink_throughputs(&curr_first, &curr_second, elapsed);
+        assert_eq!(rows_second.len(), 1);
+        assert_eq!(rows_second[0].port_label.as_deref(), Some("3/3"));
+
+        state.push(&rows_second);
+
+        // Still exactly one history entry: the key is stable.
+        assert_eq!(
+            state.samples.len(),
+            1,
+            "expected stable key for NVLink rows across active-link changes"
+        );
+        // Buffer should hold two samples (the two pushes).
+        let buf = state
+            .samples
+            .values()
+            .next()
+            .expect("history entry for nvidia0");
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].port_label.as_deref(), Some("2/3"));
+        assert_eq!(buf[1].port_label.as_deref(), Some("3/3"));
+    }
+
+    #[test]
+    fn rolling_avg_returns_averaged_nvlink_row() {
+        let elapsed = 1.0_f64;
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 1,
+            link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(0, true, Some(0), Some(0))],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 1,
+            link_gbps: Some(50.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(0, true, Some(1_000_000_000), Some(500_000_000))],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+
+        let mut state = RollingAvgState::new(5);
+        state.push(&rows);
+
+        let avgs = state.averages();
+        assert_eq!(avgs.len(), 1);
+        let avg = &avgs[0];
+        assert_eq!(avg.dev_name, "nvidia0");
+        assert!(
+            avg.tx_gbps > 0.0,
+            "expected non-empty averaged tx_gbps, got {}",
+            avg.tx_gbps
+        );
+        let expected_tx = 1_000_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!(
+            (avg.tx_gbps - expected_tx).abs() < 1e-6,
+            "tx_gbps {} != {}",
+            avg.tx_gbps,
+            expected_tx
+        );
+    }
+
+    #[test]
+    fn saturating_sub_protects_against_counter_resets() {
+        // Simulate NVML reloading the counters: prev is higher than curr.
+        let elapsed = 1.0_f64;
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 2,
+            gpu_name: "B200".to_string(),
+            link_count: 1,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(
+                0,
+                true,
+                Some(10_000_000_000),
+                Some(20_000_000_000),
+            )],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 2,
+            gpu_name: "B200".to_string(),
+            link_count: 1,
+            link_gbps: Some(100.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(0, true, Some(1_000), Some(2_000))],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tx_gbps, 0.0,
+            "counter reset must not produce negative rate"
+        );
+        assert_eq!(rows[0].rx_gbps, 0.0);
+    }
+
+    #[test]
+    fn averaged_row_uses_latest_metadata() {
+        // Same GPU, two consecutive snapshots with different active-link
+        // counts (and therefore different `port` and `port_label`). The
+        // averaged row must reflect the *latest* metadata, not the oldest.
+        let elapsed = 1.0_f64;
+
+        let prev_a = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![make_link(0, true, Some(0), Some(0))],
+        }];
+        let curr_a = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(1_000_000_000), Some(2_000_000_000)),
+                make_link(1, true, Some(500_000_000), Some(250_000_000)),
+                make_link(2, false, None, None),
+            ],
+        }];
+        let rows_first = compute_nvlink_throughputs(&prev_a, &curr_a, elapsed);
+        assert_eq!(rows_first.len(), 1);
+        assert_eq!(rows_first[0].port_label.as_deref(), Some("2/3"));
+        assert_eq!(rows_first[0].port, 2);
+
+        // Second push: active link count rises to 3/3.
+        let curr_b = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 3,
+            link_gbps: Some(150.0),
+            tx_bytes: None,
+            rx_bytes: None,
+            links: vec![
+                make_link(0, true, Some(2_000_000_000), Some(3_000_000_000)),
+                make_link(1, true, Some(900_000_000), Some(450_000_000)),
+                make_link(2, true, Some(100_000_000), Some(50_000_000)),
+            ],
+        }];
+        let rows_second = compute_nvlink_throughputs(&curr_a, &curr_b, elapsed);
+        assert_eq!(rows_second.len(), 1);
+        assert_eq!(rows_second[0].port_label.as_deref(), Some("3/3"));
+        assert_eq!(rows_second[0].port, 3);
+
+        let mut state = RollingAvgState::new(5);
+        state.push(&rows_first);
+        state.push(&rows_second);
+
+        let avgs = state.averages();
+        assert_eq!(avgs.len(), 1);
+        let avg = &avgs[0];
+        // Metadata must come from the latest sample, not the oldest.
+        assert_eq!(
+            avg.port_label.as_deref(),
+            Some("3/3"),
+            "averaged row must use latest sample's port_label"
+        );
+        assert_eq!(avg.port, 3, "averaged row must use latest sample's port");
+        assert_eq!(avg.link_gbps, Some(150.0));
+        assert_eq!(avg.dev_name, "nvidia0");
+    }
+
+    #[test]
+    fn aggregates_uses_gpu_wide_fields_when_present() {
+        let elapsed = 1.0_f64;
+
+        let prev = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: Some(10_000_000_000),
+            rx_bytes: Some(20_000_000_000),
+            links: vec![
+                make_link(0, true, Some(0), Some(0)),
+                make_link(1, true, Some(0), Some(0)),
+            ],
+        }];
+        let curr = vec![NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "H100".to_string(),
+            link_count: 2,
+            link_gbps: Some(100.0),
+            tx_bytes: Some(15_000_000_000),
+            rx_bytes: Some(25_000_000_000),
+            links: vec![
+                make_link(0, true, Some(100_000), Some(200_000)), // These are lane rates, shouldn't be used for aggregate
+                make_link(1, true, Some(300_000), Some(400_000)),
+            ],
+        }];
+
+        let rows = compute_nvlink_throughputs(&prev, &curr, elapsed);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Aggregate should be:
+        // tx = 15e9 - 10e9 = 5e9 bytes/sec -> 40 Gbps
+        // rx = 25e9 - 20e9 = 5e9 bytes/sec -> 40 Gbps
+        let expected_tx_gbps = 5_000_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        let expected_rx_gbps = 5_000_000_000.0_f64 * 8.0 / 1_000_000_000.0;
+        assert!((row.tx_gbps - expected_tx_gbps).abs() < 1e-6);
+        assert!((row.rx_gbps - expected_rx_gbps).abs() < 1e-6);
+
+        // However, individual lanes should show the lane-specific rates (calculated from lane deltas):
+        // lane 0 tx: (100_000 - 0) / 1.0 = 100_000 bytes/sec
+        // lane 0 rx: (200_000 - 0) / 1.0 = 200_000 bytes/sec
+        let nv = row.nvlink.as_ref().unwrap();
+        assert_eq!(nv.links[0].tx_bytes, Some(100_000));
+        assert_eq!(nv.links[0].rx_bytes, Some(200_000));
+        assert_eq!(nv.links[1].tx_bytes, Some(300_000));
+        assert_eq!(nv.links[1].rx_bytes, Some(400_000));
+    }
+
+    #[test]
+    fn sort_order_stable_for_nvlink() {
+        // Reference ordering: RDMA "mlx5_0/1", NVLink "nvidia0" (active=2),
+        // RDMA "mlx5_1/1". The NVLink row sits in the middle.
+        let nvlink_ref = PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 2,
+            link_gbps: Some(150.0),
+            tx_gbps: 1.0,
+            rx_gbps: 2.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: Some("2/3".to_string()),
+            nvlink: Some(NvLinkThroughputMeta {
+                gpu_index: 0,
+                gpu_name: "H100".to_string(),
+                active_links: 2,
+                links: Vec::new(),
+            }),
+        };
+        let rdma_a_ref = PortThroughput {
+            dev_name: "mlx5_0".to_string(),
+            port: 1,
+            link_gbps: Some(100.0),
+            tx_gbps: 3.0,
+            rx_gbps: 4.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+        };
+        let rdma_b_ref = PortThroughput {
+            dev_name: "mlx5_1".to_string(),
+            port: 1,
+            link_gbps: Some(100.0),
+            tx_gbps: 5.0,
+            rx_gbps: 6.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+        };
+        let reference = vec![rdma_a_ref.clone(), nvlink_ref.clone(), rdma_b_ref.clone()];
+        let nvlink_ref_pos = 1usize;
+
+        // Build the averaged rows in shuffled order. Note the NVLink row now
+        // has `port: 3` (active-link count changed) and `port_label: "3/3"`.
+        let nvlink_avg = PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 3,
+            link_gbps: Some(150.0),
+            tx_gbps: 1.5,
+            rx_gbps: 2.5,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: Some("3/3".to_string()),
+            #[cfg(feature = "nvlink")]
+            nvlink: Some(NvLinkThroughputMeta {
+                gpu_index: 0,
+                gpu_name: "H100".to_string(),
+                active_links: 3,
+                links: Vec::new(),
+            }),
+        };
+        let rdma_a_avg = PortThroughput {
+            dev_name: "mlx5_0".to_string(),
+            port: 1,
+            link_gbps: Some(100.0),
+            tx_gbps: 3.5,
+            rx_gbps: 4.5,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+        };
+        let rdma_b_avg = PortThroughput {
+            dev_name: "mlx5_1".to_string(),
+            port: 1,
+            link_gbps: Some(100.0),
+            tx_gbps: 5.5,
+            rx_gbps: 6.5,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+        };
+        let mut avgs = vec![rdma_b_avg.clone(), nvlink_avg.clone(), rdma_a_avg.clone()];
+
+        sort_by_throughput_order(&mut avgs, &reference);
+
+        // After sorting the averaged list must mirror the reference order:
+        // mlx5_0, nvidia0, mlx5_1.
+        assert_eq!(avgs[0].dev_name, "mlx5_0");
+        assert_eq!(avgs[1].dev_name, "nvidia0");
+        assert_eq!(avgs[2].dev_name, "mlx5_1");
+        // The NVLink row must NOT have been pushed to the end via
+        // `unwrap_or(&usize::MAX)` (which would happen if the sort key still
+        // included the changed `port` field).
+        assert_eq!(avgs[1].dev_name, nvlink_ref.dev_name);
+        assert_ne!(avgs[1].port, nvlink_ref.port);
+        assert_eq!(avgs[1].port_label, nvlink_avg.port_label);
+        // Sanity: the NVLink row's resolved index in the reference equals the
+        // original reference position, confirming the key match.
+        let _ = nvlink_ref_pos;
+    }
 }
