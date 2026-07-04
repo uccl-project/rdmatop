@@ -10,15 +10,10 @@
 
 <!-- Paste the outcome: command output, before/after counters, screenshots of the TUI, etc. -->
 
----
-
-<details>
-<summary>Checklist</summary>
+## Checklist
 
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo test` passes
 - [ ] Tested on RDMA-capable hardware (or explained why not in the Test Plan)
 - [ ] Docs/README updated if behavior or flags changed
-
-</details>
