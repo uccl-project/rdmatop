@@ -251,10 +251,11 @@ pub fn read_all_xgmi_stats() -> io::Result<Vec<XgmiSnapshot>> {
     }
     let bdfs: Vec<Option<u64>> = handles.iter().map(|&h| read_bdf(api, h)).collect();
     let names = gpu_names(api, &handles);
+    let speeds = link_speeds(api, &handles);
 
     let mut snapshots = Vec::with_capacity(handles.len());
     for idx in 0..handles.len() {
-        if let Some(snap) = read_processor_snapshot(api, &handles, &bdfs, names, idx) {
+        if let Some(snap) = read_processor_snapshot(api, &handles, &bdfs, names, speeds, idx) {
             snapshots.push(snap);
         }
     }
@@ -272,6 +273,17 @@ fn gpu_names(api: &Amdsmi, handles: &[ffi::ProcessorHandle]) -> &'static [String
             .map(|&h| read_gpu_name(api, h).unwrap_or_default())
             .collect()
     })
+}
+
+/// Per-GPU (bit_rate, bandwidth) Gb/s, read once and cached by GPU index:
+/// link speed is static and `amdsmi_get_pcie_info` costs ~0.5 ms per call —
+/// roughly half of the whole refresh when polled for every GPU each second.
+fn link_speeds(
+    api: &Amdsmi,
+    handles: &[ffi::ProcessorHandle],
+) -> &'static [(Option<f64>, Option<f64>)] {
+    static SPEEDS: OnceLock<Vec<(Option<f64>, Option<f64>)>> = OnceLock::new();
+    SPEEDS.get_or_init(|| handles.iter().map(|&h| read_link_speed(api, h)).collect())
 }
 
 /// Flatten socket/processor enumeration into one ordered GPU handle list.
@@ -319,6 +331,7 @@ fn read_processor_snapshot(
     handles: &[ffi::ProcessorHandle],
     bdfs: &[Option<u64>],
     names: &[String],
+    speeds: &[(Option<f64>, Option<f64>)],
     idx: usize,
 ) -> Option<XgmiSnapshot> {
     let handle = handles[idx];
@@ -330,7 +343,7 @@ fn read_processor_snapshot(
     let metrics = &metrics.value;
 
     let gpu_name = names.get(idx).cloned().unwrap_or_default();
-    let (bit_rate_gbps, speed_gbps) = read_link_speed(api, handle);
+    let (bit_rate_gbps, speed_gbps) = speeds.get(idx).copied().unwrap_or((None, None));
     let (correctable_errors, uncorrectable_errors) = read_wafl_errors(api, handle);
 
     let n = (metrics.num_links as usize).min(ffi::AMDSMI_MAX_NUM_XGMI_PHYSICAL_LINK);
