@@ -1109,30 +1109,42 @@ fn compute_xgmi_throughputs(
         let mut tx_total: u64 = 0;
         let mut rx_total: u64 = 0;
         let mut links = Vec::with_capacity(gpu.links.len());
+        // Both samples must exist to diff: a link or counter reappearing
+        // after a gap would otherwise diff its lifetime TB-scale
+        // accumulator against zero and render an absurd rate spike.
+        let delta = |c: Option<u64>, p: Option<u64>| match (c, p) {
+            (Some(c), Some(p)) => c.saturating_sub(p),
+            _ => 0,
+        };
         for link in &gpu.links {
             let prev_link =
                 prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
-            let tx_delta = link
-                .tx_bytes
-                .unwrap_or(0)
-                .saturating_sub(prev_link.and_then(|l| l.tx_bytes).unwrap_or(0));
-            let rx_delta = link
-                .rx_bytes
-                .unwrap_or(0)
-                .saturating_sub(prev_link.and_then(|l| l.rx_bytes).unwrap_or(0));
+            let (tx_delta, rx_delta) = match prev_link {
+                Some(pl) => (
+                    delta(link.tx_bytes, pl.tx_bytes),
+                    delta(link.rx_bytes, pl.rx_bytes),
+                ),
+                None => (0, 0),
+            };
             tx_total = tx_total.saturating_add(tx_delta);
             rx_total = rx_total.saturating_add(rx_delta);
 
+            // Keep "no counter data" as None so the pane can show "-"
+            // instead of a fabricated 0.0 rate.
             let mut link_rate = link.clone();
-            link_rate.tx_bytes = Some((tx_delta as f64 / elapsed) as u64);
-            link_rate.rx_bytes = Some((rx_delta as f64 / elapsed) as u64);
+            link_rate.tx_bytes = link.tx_bytes.map(|_| (tx_delta as f64 / elapsed) as u64);
+            link_rate.rx_bytes = link.rx_bytes.map(|_| (rx_delta as f64 / elapsed) as u64);
             links.push(link_rate);
         }
 
         let mut counter_rates: Vec<CounterRate> = Vec::new();
         if let Some(v) = gpu.correctable_errors {
-            let prev_v = prev_gpu.and_then(|p| p.correctable_errors).unwrap_or(0);
-            let delta = v.saturating_sub(prev_v);
+            // Missing prev => zero delta, same convention as the byte
+            // counters above (the accumulated total still shows in `value`).
+            let delta = match prev_gpu.and_then(|p| p.correctable_errors) {
+                Some(prev_v) => v.saturating_sub(prev_v),
+                None => 0,
+            };
             counter_rates.push(CounterRate {
                 name: "xgmi_wafl_ce".to_string(),
                 value: v,
@@ -1142,8 +1154,10 @@ fn compute_xgmi_throughputs(
             });
         }
         if let Some(v) = gpu.uncorrectable_errors {
-            let prev_v = prev_gpu.and_then(|p| p.uncorrectable_errors).unwrap_or(0);
-            let delta = v.saturating_sub(prev_v);
+            let delta = match prev_gpu.and_then(|p| p.uncorrectable_errors) {
+                Some(prev_v) => v.saturating_sub(prev_v),
+                None => 0,
+            };
             counter_rates.push(CounterRate {
                 name: "xgmi_wafl_ue".to_string(),
                 value: v,
@@ -1235,12 +1249,48 @@ mod xgmi_tests {
     }
 
     #[test]
-    fn first_sample_uses_zero_prev() {
+    fn unseen_gpu_emits_zero_rates() {
+        // A GPU with no prior sample must not diff its lifetime accumulator
+        // against zero (would render an absurd spike mid-run).
         let curr = vec![mk_gpu(0, vec![mk_link(0, true, 4096, 8192)])];
         let rows = compute_xgmi_throughputs(&[], &curr, 2.0);
         let row = &rows[0];
-        assert!((row.tx_gbps - bytes_to_gbps(2048.0)).abs() < 1e-12);
-        assert!((row.rx_gbps - bytes_to_gbps(4096.0)).abs() < 1e-12);
+        assert_eq!(row.tx_gbps, 0.0);
+        assert_eq!(row.rx_gbps, 0.0);
+        let meta = row.xgmi.as_ref().expect("xgmi meta present");
+        assert_eq!(meta.links[0].tx_bytes, Some(0));
+        assert_eq!(meta.links[0].rx_bytes, Some(0));
+    }
+
+    #[test]
+    fn counter_reappearing_after_gap_emits_zero() {
+        // prev sample exists but carried no counter data: diffing the
+        // reappeared lifetime accumulator against zero must not spike.
+        let mut prev_link = mk_link(0, true, 0, 0);
+        prev_link.tx_bytes = None;
+        prev_link.rx_bytes = None;
+        let prev = vec![mk_gpu(0, vec![prev_link])];
+        let curr = vec![mk_gpu(
+            0,
+            vec![mk_link(0, true, u64::MAX / 2, u64::MAX / 2)],
+        )];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        assert_eq!(rows[0].tx_gbps, 0.0);
+        assert_eq!(rows[0].rx_gbps, 0.0);
+    }
+
+    #[test]
+    fn missing_counters_stay_none() {
+        // Peers without accumulator data must not fabricate 0.0 rates.
+        let mut link = mk_link(0, true, 0, 0);
+        link.tx_bytes = None;
+        link.rx_bytes = None;
+        let prev = vec![mk_gpu(0, vec![link.clone()])];
+        let curr = vec![mk_gpu(0, vec![link])];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        let meta = rows[0].xgmi.as_ref().expect("xgmi meta present");
+        assert_eq!(meta.links[0].tx_bytes, None);
+        assert_eq!(meta.links[0].rx_bytes, None);
     }
 
     #[test]
