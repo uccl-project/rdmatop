@@ -66,6 +66,7 @@ to when you pressed `r`, so the trace spans exactly your record window.
 Use `rdmatop` to monitor RDMA traffic while running GPU
 communication benchmarks:
 
+- [PyTorch](examples/pytorch/) — intranode NVLink/XGMI traffic
 - [IB Perftest](examples/ib/) — two-node `ib_write_bw` benchmark
 - [UCX Perftest](examples/ucx/) — two-node `ucx_perftest` bandwidth / latency
 - [NCCL](examples/nccl/) — collective communication
