@@ -650,14 +650,17 @@ fn build_xgmi_detail_lines(
     lines.push(Line::from(""));
 
     lines.push(Line::from(vec![styled(
-        " Link  State   Gbps   TX MB/s   RX MB/s  Remote",
+        " Peer  State   Gbps   TX MB/s   RX MB/s  Remote",
         tc.header_fg,
         true,
     )]));
 
     for link in &meta.links {
-        let tx_mb_s = link.tx_bytes.unwrap_or(0) as f64 / 1_000_000.0;
-        let rx_mb_s = link.rx_bytes.unwrap_or(0) as f64 / 1_000_000.0;
+        // "-" marks counters amdsmi did not report (vs a real 0.0 rate).
+        let mb_s = |bytes: Option<u64>| match bytes {
+            Some(b) => format!("{:>7.1}", b as f64 / 1_000_000.0),
+            None => format!("{:>7}", "-"),
+        };
         let state_label = if link.is_active { "up" } else { "down" };
         let state_color = if link.is_active { tc.good } else { tc.muted };
         let gbps_label = link
@@ -674,8 +677,8 @@ fn build_xgmi_detail_lines(
             styled(&format!(" {:>4}", link.link_id), tc.accent, false),
             styled(&format!("  {:<6}", state_label), state_color, false),
             styled(&format!("  {:>4}", gbps_label), tc.fg, false),
-            styled(&format!("  {:>7.1}", tx_mb_s), tc.fg, false),
-            styled(&format!("  {:>7.1}", rx_mb_s), tc.fg, false),
+            styled(&format!("  {}", mb_s(link.tx_bytes)), tc.fg, false),
+            styled(&format!("  {}", mb_s(link.rx_bytes)), tc.fg, false),
             styled(&format!("  {}", remote_label), tc.muted, false),
         ]));
     }
@@ -1570,7 +1573,7 @@ mod nvlink_detail_tests {
             // The MB/s value is rendered as `{:>6.1}` so it appears as
             // " 125.0" (leading space from the width spec).
             assert!(
-                lane_row.contains(&format!("{}", expected_mb_s)),
+                lane_row.contains(&expected_mb_s.to_string()),
                 "lane {} row missing aggregate MB/s value {}: {:?}",
                 link.link_id,
                 expected_mb_s,
@@ -1787,5 +1790,22 @@ mod xgmi_detail_tests {
             .expect("errors line");
         assert!(err.contains("wafl_ce=7"), "err: {err:?}");
         assert!(err.contains("wafl_ue=1"), "err: {err:?}");
+    }
+
+    #[test]
+    fn missing_counters_render_as_dash() {
+        let tc = Theme::Default.colors();
+        let mut link = mk_link(0, true, 0, 0);
+        link.tx_bytes = None;
+        link.rx_bytes = None;
+        let (port, meta) = mk_row(vec![link]);
+        let lines = build_xgmi_detail_lines(&port, &meta, None, &tc, false, 0);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let row = text
+            .iter()
+            .find(|l| l.contains("0000:15:00.0"))
+            .expect("link row");
+        // Both the TX and RX cells must show "-" (the BDF carries no dash).
+        assert!(row.matches('-').count() >= 2, "row: {row:?}");
     }
 }
