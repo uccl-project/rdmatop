@@ -5,7 +5,7 @@
 use std::ffi::CStr;
 use std::io;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Snapshot of a single XGMI link at one sample.
 #[derive(Clone, Debug)]
@@ -255,7 +255,7 @@ pub fn read_all_xgmi_stats() -> io::Result<Vec<XgmiSnapshot>> {
 
     let mut snapshots = Vec::with_capacity(handles.len());
     for idx in 0..handles.len() {
-        if let Some(snap) = read_processor_snapshot(api, &handles, &bdfs, names, speeds, idx) {
+        if let Some(snap) = read_processor_snapshot(api, &handles, &bdfs, names, &speeds, idx) {
             snapshots.push(snap);
         }
     }
@@ -275,15 +275,33 @@ fn gpu_names(api: &Amdsmi, handles: &[ffi::ProcessorHandle]) -> &'static [String
     })
 }
 
-/// Per-GPU (bit_rate, bandwidth) Gb/s, read once and cached by GPU index:
-/// link speed is static and `amdsmi_get_pcie_info` costs ~0.5 ms per call —
-/// roughly half of the whole refresh when polled for every GPU each second.
-fn link_speeds(
-    api: &Amdsmi,
-    handles: &[ffi::ProcessorHandle],
-) -> &'static [(Option<f64>, Option<f64>)] {
-    static SPEEDS: OnceLock<Vec<(Option<f64>, Option<f64>)>> = OnceLock::new();
-    SPEEDS.get_or_init(|| handles.iter().map(|&h| read_link_speed(api, h)).collect())
+/// Per-link (bit_rate, bandwidth) in Gb/s from PCIe static info.
+type LinkSpeed = (Option<f64>, Option<f64>);
+
+/// Per-GPU link speeds. Link speed is static and `amdsmi_get_pcie_info`
+/// costs ~0.5 ms (two SMU round-trips), so successful reads are cached by
+/// GPU index; failed reads retry on the next poll rather than degrading
+/// speed reporting for the process lifetime.
+fn link_speeds(api: &Amdsmi, handles: &[ffi::ProcessorHandle]) -> Vec<LinkSpeed> {
+    static CACHE: Mutex<Vec<Option<LinkSpeed>>> = Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() < handles.len() {
+        cache.resize(handles.len(), None);
+    }
+    handles
+        .iter()
+        .zip(cache.iter_mut())
+        .map(|(&handle, slot)| match slot {
+            Some(speed) => *speed,
+            None => {
+                let speed = read_link_speed(api, handle);
+                if speed != (None, None) {
+                    *slot = Some(speed);
+                }
+                speed
+            }
+        })
+        .collect()
 }
 
 /// Flatten socket/processor enumeration into one ordered GPU handle list.
@@ -331,7 +349,7 @@ fn read_processor_snapshot(
     handles: &[ffi::ProcessorHandle],
     bdfs: &[Option<u64>],
     names: &[String],
-    speeds: &[(Option<f64>, Option<f64>)],
+    speeds: &[LinkSpeed],
     idx: usize,
 ) -> Option<XgmiSnapshot> {
     let handle = handles[idx];
@@ -408,7 +426,7 @@ fn is_xgmi_peer(api: &Amdsmi, src: ffi::ProcessorHandle, dst: ffi::ProcessorHand
 
 /// Per-link (bit_rate, bandwidth) in Gb/s from PCIe static info, mirroring
 /// amd-smi: bit_rate = max_pcie_speed/1000, bandwidth = bit_rate * width.
-fn read_link_speed(api: &Amdsmi, handle: ffi::ProcessorHandle) -> (Option<f64>, Option<f64>) {
+fn read_link_speed(api: &Amdsmi, handle: ffi::ProcessorHandle) -> LinkSpeed {
     let mut info: Padded<ffi::PcieInfo> = Padded::zeroed();
     let rc = unsafe { (api.get_pcie_info)(handle, &mut info.value) };
     if rc != ffi::AMDSMI_STATUS_SUCCESS || info.value.max_pcie_speed == 0 {
