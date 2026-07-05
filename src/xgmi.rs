@@ -342,18 +342,24 @@ fn read_processor_snapshot(
         }
         // Accumulators are indexed by destination GPU; peers beyond the
         // reported entry count carry no counters but still show the link.
-        let (tx_bytes, rx_bytes) = if peer_idx < n {
-            let entry = &metrics.links[peer_idx];
-            (
-                Some(entry.write_kb.wrapping_mul(1024)),
-                Some(entry.read_kb.wrapping_mul(1024)),
-            )
-        } else {
-            (None, None)
+        // The positional mapping is trusted only while the entry's own bdf
+        // is unset (always zero on ROCm 6.4) or agrees with the peer's.
+        let (tx_bytes, rx_bytes) = match metrics.links.get(peer_idx) {
+            Some(entry)
+                if peer_idx < n && (entry.bdf == 0 || Some(entry.bdf) == bdfs[peer_idx]) =>
+            {
+                (
+                    Some(entry.write_kb.wrapping_mul(1024)),
+                    Some(entry.read_kb.wrapping_mul(1024)),
+                )
+            }
+            _ => (None, None),
         };
         total_gbps += speed_gbps.unwrap_or(0.0);
         links.push(XgmiLinkSnapshot {
             link_id: peer_idx as u32,
+            // amdsmi_get_gpu_xgmi_link_status reports DOWN/DISABLE on
+            // working MI300 links, so topo-confirmed peers show as active.
             is_active: true,
             speed_gbps,
             bit_rate_gbps,
@@ -517,6 +523,15 @@ mod tests {
                 assert!(
                     l.speed_gbps.unwrap_or(0.0) > 0.0,
                     "gpu{} link{} has zero speed",
+                    s.gpu_index,
+                    l.link_id
+                );
+                // Guards the positional accumulator mapping: every peer on
+                // this host must carry counters (catches off-by-one in `n`
+                // and bdf-mismatch degradation).
+                assert!(
+                    l.tx_bytes.is_some() && l.rx_bytes.is_some(),
+                    "gpu{} link{} has no accumulator data",
                     s.gpu_index,
                     l.link_id
                 );
