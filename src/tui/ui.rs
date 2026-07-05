@@ -599,6 +599,115 @@ fn build_nvlink_detail_lines(
     lines
 }
 
+/// Build the per-link detail panel for an XGMI GPU row.
+/// Layout mirrors the NVLink pane: header, TX/RX sparklines, a link table
+/// (Link, State, Gbps, TX MB/s, RX MB/s, Remote), then XGMI_WAFL ECC counts.
+#[cfg(feature = "xgmi")]
+fn build_xgmi_detail_lines(
+    t: &PortThroughput,
+    meta: &super::app::XgmiThroughputMeta,
+    history: Option<&super::app::DeviceHistory>,
+    tc: &ThemeColors,
+    show_avg: bool,
+    avg_window: usize,
+) -> Vec<Line<'static>> {
+    let spark_w = 30;
+    let (tx_spark, rx_spark) = match history {
+        Some(h) => (sparkline_str(&h.tx, spark_w), sparkline_str(&h.rx, spark_w)),
+        None => (" ".repeat(spark_w), " ".repeat(spark_w)),
+    };
+    let avg_label = if show_avg {
+        format!("  [avg {}s]", avg_window)
+    } else {
+        String::new()
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(vec![
+        styled(" Device: ", tc.muted, false),
+        styled(&t.dev_name, tc.accent, true),
+        styled("  [XGMI]  ", tc.accent, false),
+        styled(
+            &format!("{}/{} active", meta.active_links, meta.links.len()),
+            tc.fg,
+            false,
+        ),
+        styled(&avg_label, tc.accent, false),
+    ]));
+
+    lines.push(Line::from(vec![
+        styled(" TX: ", tc.muted, false),
+        styled(&format!("{:.2} Gbps ", t.tx_gbps), tc.good, false),
+        styled(&tx_spark, tc.good, false),
+    ]));
+    lines.push(Line::from(vec![
+        styled(" RX: ", tc.muted, false),
+        styled(&format!("{:.2} Gbps ", t.rx_gbps), tc.accent, false),
+        styled(&rx_spark, tc.accent, false),
+    ]));
+
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![styled(
+        " Link  State   Gbps   TX MB/s   RX MB/s  Remote",
+        tc.header_fg,
+        true,
+    )]));
+
+    for link in &meta.links {
+        let tx_mb_s = link.tx_bytes.unwrap_or(0) as f64 / 1_000_000.0;
+        let rx_mb_s = link.rx_bytes.unwrap_or(0) as f64 / 1_000_000.0;
+        let state_label = if link.is_active { "up" } else { "down" };
+        let state_color = if link.is_active { tc.good } else { tc.muted };
+        let gbps_label = link
+            .speed_gbps
+            .map(|v| format!("{:.0}", v))
+            .unwrap_or_else(|| "-".to_string());
+        // XGMI peers are always GPUs; show a bare "-" when the BDF is unknown.
+        let remote_label = link
+            .remote_pci_bdf
+            .as_ref()
+            .map(|bdf| format!("GPU {}", bdf))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(Line::from(vec![
+            styled(&format!(" {:>4}", link.link_id), tc.accent, false),
+            styled(&format!("  {:<6}", state_label), state_color, false),
+            styled(&format!("  {:>4}", gbps_label), tc.fg, false),
+            styled(&format!("  {:>7.1}", tx_mb_s), tc.fg, false),
+            styled(&format!("  {:>7.1}", rx_mb_s), tc.fg, false),
+            styled(&format!("  {}", remote_label), tc.muted, false),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // XGMI_WAFL ECC counters come through counter_rates (per-GPU values).
+    let counter = |name: &str| -> u64 {
+        t.counter_rates
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.value)
+            .unwrap_or(0)
+    };
+    lines.push(Line::from(vec![
+        styled(" Errors: ", tc.muted, false),
+        styled(
+            &format!("wafl_ce={}", counter("xgmi_wafl_ce")),
+            tc.warning,
+            false,
+        ),
+        styled("  ", tc.muted, false),
+        styled(
+            &format!("wafl_ue={}", counter("xgmi_wafl_ue")),
+            tc.warning,
+            false,
+        ),
+    ]));
+
+    lines
+}
+
 fn build_device_header(
     t: &PortThroughput,
     history: Option<&super::app::DeviceHistory>,
@@ -705,6 +814,27 @@ fn process_line(p: &crate::stat::ProcessRdmaInfo, tc: &ThemeColors) -> Line<'sta
     ])
 }
 
+/// Pick the right detail pane builder for the selected row: NVLink pane,
+/// XGMI pane, or the generic RDMA device pane.
+fn build_selected_detail_lines(
+    t: &PortThroughput,
+    procs: &[&crate::stat::ProcessRdmaInfo],
+    history: Option<&super::app::DeviceHistory>,
+    tc: &ThemeColors,
+    show_avg: bool,
+    avg_window: usize,
+) -> Vec<Line<'static>> {
+    #[cfg(feature = "nvlink")]
+    if let Some(ref meta) = t.nvlink {
+        return build_nvlink_detail_lines(t, meta, history, tc, show_avg, avg_window);
+    }
+    #[cfg(feature = "xgmi")]
+    if let Some(ref meta) = t.xgmi {
+        return build_xgmi_detail_lines(t, meta, history, tc, show_avg, avg_window);
+    }
+    build_detail_lines(t, procs, history, tc, show_avg, avg_window)
+}
+
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let display = app.display_throughputs();
     let t = match display.get(app.selected_row).cloned() {
@@ -724,29 +854,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let history = app.history.get(&t.dev_name);
     let procs = app.selected_device_processes();
 
-    #[cfg(feature = "nvlink")]
-    let lines = if let Some(ref meta) = t.nvlink {
-        build_nvlink_detail_lines(
-            &t,
-            meta,
-            history,
-            tc,
-            app.show_rolling_avg,
-            app.rolling_avg.window_secs,
-        )
-    } else {
-        build_detail_lines(
-            &t,
-            &procs,
-            history,
-            tc,
-            app.show_rolling_avg,
-            app.rolling_avg.window_secs,
-        )
-    };
-
-    #[cfg(not(feature = "nvlink"))]
-    let lines = build_detail_lines(
+    let lines = build_selected_detail_lines(
         &t,
         &procs,
         history,
@@ -1129,6 +1237,8 @@ mod nvlink_detail_tests {
             counter_rates,
             port_label: Some(format!("{}/{}", active, links.len())),
             nvlink: Some(meta.clone()),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         (port, meta)
     }
@@ -1417,6 +1527,8 @@ mod nvlink_detail_tests {
             counter_rates: Vec::new(),
             port_label: Some("2/3".to_string()),
             nvlink: Some(meta.clone()),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
 
         let tc = Theme::Default.colors();
@@ -1524,6 +1636,8 @@ mod nvlink_detail_tests {
             counter_rates: Vec::new(),
             port_label: Some("2/2".to_string()),
             nvlink: Some(meta.clone()),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
 
         let tc = Theme::Default.colors();
@@ -1558,5 +1672,120 @@ mod nvlink_detail_tests {
             lane1_row.contains("  40.0"),
             "lane 1 missing RX: {lane1_row:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "xgmi"))]
+mod xgmi_detail_tests {
+    use super::*;
+    use crate::tui::app::{PortThroughput, XgmiThroughputMeta};
+    use crate::tui::theme::Theme;
+    use crate::xgmi::XgmiLinkSnapshot;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn mk_link(id: u32, active: bool, tx_rate: u64, rx_rate: u64) -> XgmiLinkSnapshot {
+        XgmiLinkSnapshot {
+            link_id: id,
+            is_active: active,
+            speed_gbps: Some(512.0),
+            bit_rate_gbps: Some(32.0),
+            remote_pci_bdf: Some(format!("0000:{:02x}:00.0", 0x15 + id)),
+            tx_bytes: Some(tx_rate),
+            rx_bytes: Some(rx_rate),
+        }
+    }
+
+    fn mk_row(links: Vec<XgmiLinkSnapshot>) -> (PortThroughput, XgmiThroughputMeta) {
+        let active = links.iter().filter(|l| l.is_active).count() as u32;
+        let meta = XgmiThroughputMeta {
+            gpu_index: 0,
+            gpu_name: "MI325X".to_string(),
+            active_links: active,
+            links,
+        };
+        let port = PortThroughput {
+            dev_name: "amdgpu0".to_string(),
+            port: active,
+            link_gbps: Some(512.0 * active as f64),
+            tx_gbps: 1.0,
+            rx_gbps: 2.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: vec![
+                crate::tui::app::CounterRate {
+                    name: "xgmi_wafl_ce".to_string(),
+                    value: 7,
+                    delta: 0,
+                    rate: 0.0,
+                    is_bytes: false,
+                },
+                crate::tui::app::CounterRate {
+                    name: "xgmi_wafl_ue".to_string(),
+                    value: 1,
+                    delta: 0,
+                    rate: 0.0,
+                    is_bytes: false,
+                },
+            ],
+            port_label: Some(format!("{}/{}", active, meta.links.len())),
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+            xgmi: Some(meta.clone()),
+        };
+        (port, meta)
+    }
+
+    #[test]
+    fn header_shows_device_and_active_links() {
+        let tc = Theme::Default.colors();
+        let (port, meta) = mk_row(vec![mk_link(0, true, 0, 0), mk_link(1, false, 0, 0)]);
+        let lines = build_xgmi_detail_lines(&port, &meta, None, &tc, false, 0);
+        let header = line_text(&lines[0]);
+        assert!(header.contains("amdgpu0"), "header: {header:?}");
+        assert!(header.contains("[XGMI]"), "header: {header:?}");
+        assert!(header.contains("1/2 active"), "header: {header:?}");
+    }
+
+    #[test]
+    fn per_link_rows_show_rate_and_remote() {
+        let tc = Theme::Default.colors();
+        // 2_000_000 B/s -> 2.0 MB/s
+        let (port, meta) = mk_row(vec![mk_link(0, true, 2_000_000, 4_000_000)]);
+        let lines = build_xgmi_detail_lines(&port, &meta, None, &tc, false, 0);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let row = text
+            .iter()
+            .find(|l| l.contains("0000:15:00.0"))
+            .expect("link row");
+        assert!(row.contains("up"), "row: {row:?}");
+        assert!(row.contains("2.0"), "row: {row:?}");
+        assert!(row.contains("4.0"), "row: {row:?}");
+    }
+
+    #[test]
+    fn inactive_link_rendered_down() {
+        let tc = Theme::Default.colors();
+        let (port, meta) = mk_row(vec![mk_link(0, false, 0, 0)]);
+        let lines = build_xgmi_detail_lines(&port, &meta, None, &tc, false, 0);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("down")), "lines: {text:?}");
+    }
+
+    #[test]
+    fn errors_line_shows_wafl_counts() {
+        let tc = Theme::Default.colors();
+        let (port, meta) = mk_row(vec![mk_link(0, true, 0, 0)]);
+        let lines = build_xgmi_detail_lines(&port, &meta, None, &tc, false, 0);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let err = text
+            .iter()
+            .find(|l| l.contains("wafl_ce"))
+            .expect("errors line");
+        assert!(err.contains("wafl_ce=7"), "err: {err:?}");
+        assert!(err.contains("wafl_ue=1"), "err: {err:?}");
     }
 }

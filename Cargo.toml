@@ -10,6 +10,7 @@ categories = ["network-programming", "command-line-utilities"]
 
 [features]
 nvlink = ["dep:nvml-wrapper", "dep:nvml-wrapper-sys"]
+xgmi = ["dep:libloading"]
 
 [profile.release]
 strip = true
@@ -28,3 +29,4 @@ ratatui = "0.30"
 crossterm = "0.29"
 nvml-wrapper = { version = "0.12.1", optional = true }
 nvml-wrapper-sys = { version = "0.9.1", optional = true }
+libloading = { version = "0.8", optional = true }
