@@ -8,6 +8,9 @@ mod tui;
 #[cfg(feature = "nvlink")]
 mod nvlink;
 
+#[cfg(feature = "xgmi")]
+mod xgmi;
+
 use std::io;
 use std::time::Instant;
 

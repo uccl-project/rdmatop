@@ -26,6 +26,26 @@ pub struct PortThroughput {
     /// by the TUI detail pane when the `nvlink` feature is enabled.
     #[cfg(feature = "nvlink")]
     pub nvlink: Option<NvLinkThroughputMeta>,
+    /// XGMI metadata attached to this row when the `xgmi` feature is enabled.
+    #[cfg(feature = "xgmi")]
+    pub xgmi: Option<XgmiThroughputMeta>,
+}
+
+/// Per-GPU XGMI metadata attached to a `PortThroughput` row when the
+/// `xgmi` feature is enabled. Mirrors `NvLinkThroughputMeta`; `links[]`
+/// tx/rx are rewritten as per-second byte rates for the detail pane.
+#[cfg(feature = "xgmi")]
+#[derive(Clone, Debug)]
+pub struct XgmiThroughputMeta {
+    /// Not rendered yet (rows already show `amdgpu<index>` via `dev_name`);
+    /// kept so future panels (e.g. topology graph) can reference it.
+    #[allow(dead_code)]
+    pub gpu_index: u32,
+    /// Marketing name (e.g. "AMD Instinct MI325X"); kept for future panels.
+    #[allow(dead_code)]
+    pub gpu_name: String,
+    pub active_links: u32,
+    pub links: Vec<crate::xgmi::XgmiLinkSnapshot>,
 }
 
 /// Per-GPU NVLink metadata attached to a `PortThroughput` row when the
@@ -233,6 +253,8 @@ impl RollingAvgState {
             port_label: latest.port_label.clone(),
             #[cfg(feature = "nvlink")]
             nvlink: latest.nvlink.clone(),
+            #[cfg(feature = "xgmi")]
+            xgmi: latest.xgmi.clone(),
         };
         if let Some(template) = window.last() {
             avg.counter_rates = template
@@ -333,6 +355,8 @@ pub struct App {
     pub record_status: Option<String>,
     #[cfg(feature = "nvlink")]
     prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
+    #[cfg(feature = "xgmi")]
+    prev_xgmi: Vec<crate::xgmi::XgmiSnapshot>,
 }
 
 const HISTORY_LEN: usize = 60;
@@ -407,8 +431,13 @@ impl App {
             cached_display: Vec::new(),
             recorder: None,
             record_status: None,
+            // Pre-read like prev_stats above: NVML/amdsmi counters are
+            // cumulative since driver load, so an empty baseline would
+            // render an absurd first-frame rate spike.
             #[cfg(feature = "nvlink")]
-            prev_nvlink: Vec::new(),
+            prev_nvlink: crate::nvlink::read_all_nvlink_stats().unwrap_or_default(),
+            #[cfg(feature = "xgmi")]
+            prev_xgmi: crate::xgmi::read_all_xgmi_stats().unwrap_or_default(),
         }
     }
 
@@ -431,6 +460,14 @@ impl App {
                 compute_nvlink_throughputs(&self.prev_nvlink, &curr_nvlink, elapsed);
             self.throughputs.append(&mut nvlink_rows);
             self.prev_nvlink = curr_nvlink;
+        }
+
+        #[cfg(feature = "xgmi")]
+        {
+            let curr_xgmi = crate::xgmi::read_all_xgmi_stats().unwrap_or_default();
+            let mut xgmi_rows = compute_xgmi_throughputs(&self.prev_xgmi, &curr_xgmi, elapsed);
+            self.throughputs.append(&mut xgmi_rows);
+            self.prev_xgmi = curr_xgmi;
         }
 
         // Stable display order: sort once here so history, rolling averages,
@@ -867,6 +904,8 @@ fn compute_port_throughput(
         port_label: None,
         #[cfg(feature = "nvlink")]
         nvlink: None,
+        #[cfg(feature = "xgmi")]
+        xgmi: None,
     }
 }
 
@@ -878,13 +917,15 @@ fn compute_throughputs(prev: &[PortStat], curr: &[PortStat], elapsed: f64) -> Ve
 
 /// Stable identity key for a `PortThroughput` row across refreshes.
 ///
-/// For NVLink rows the `port` field encodes the active-link count, which can
-/// change between samples even when the underlying GPU is the same. Using
-/// `dev_name` alone keeps the key (and therefore sort order and rolling-avg
-/// history) stable across those changes.
+/// NVLink and XGMI rows key by `dev_name` alone because their `port` field
+/// encodes the active-link count, which can change between samples.
 fn throughput_key(t: &PortThroughput) -> String {
     #[cfg(feature = "nvlink")]
     if t.nvlink.is_some() {
+        return t.dev_name.clone();
+    }
+    #[cfg(feature = "xgmi")]
+    if t.xgmi.is_some() {
         return t.dev_name.clone();
     }
     format!("{}/{}", t.dev_name, t.port)
@@ -911,9 +952,10 @@ fn sort_by_throughput_order(avgs: &mut [PortThroughput], reference: &[PortThroug
 
 /// Compute one `PortThroughput` row per GPU from a pair of NVLink snapshots.
 ///
-/// The previous snapshot is looked up by `gpu_index`. Missing previous links
-/// (or `None` byte counters) are treated as zero so a freshly-observed GPU
-/// surfaces its full current byte counts as the first delta.
+/// The previous snapshot is looked up by `gpu_index`. A GPU, link, or
+/// counter without a prior sample emits a zero delta: NVML counters are
+/// cumulative since driver load, so diffing against zero would render an
+/// absurd rate spike (same convention as `compute_xgmi_throughputs`).
 ///
 /// NVML exposes `NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX/RX` as a *GPU-wide*
 /// aggregate, not per-link counters. Each link in `LinkSnapshot::tx_bytes` /
@@ -930,6 +972,12 @@ fn compute_nvlink_throughputs(
     curr: &[crate::nvlink::NvLinkSnapshot],
     elapsed: f64,
 ) -> Vec<PortThroughput> {
+    // Both samples must exist to diff: a counter reappearing after a gap
+    // would otherwise diff its cumulative value against zero.
+    let delta = |c: Option<u64>, p: Option<u64>| match (c, p) {
+        (Some(c), Some(p)) => c.saturating_sub(p),
+        _ => 0,
+    };
     let mut out = Vec::with_capacity(curr.len());
     for gpu in curr {
         let prev_gpu = prev.iter().find(|p| p.gpu_index == gpu.gpu_index);
@@ -937,13 +985,9 @@ fn compute_nvlink_throughputs(
 
         // Calculate GPU-wide aggregate throughput, preferring the u32::MAX aggregate fields.
         let (tx_bytes_total, rx_bytes_total) = if gpu.tx_bytes.is_some() || gpu.rx_bytes.is_some() {
-            let curr_tx = gpu.tx_bytes.unwrap_or(0);
-            let prev_tx = prev_gpu.and_then(|p| p.tx_bytes).unwrap_or(0);
-            let curr_rx = gpu.rx_bytes.unwrap_or(0);
-            let prev_rx = prev_gpu.and_then(|p| p.rx_bytes).unwrap_or(0);
             (
-                curr_tx.saturating_sub(prev_tx),
-                curr_rx.saturating_sub(prev_rx),
+                delta(gpu.tx_bytes, prev_gpu.and_then(|p| p.tx_bytes)),
+                delta(gpu.rx_bytes, prev_gpu.and_then(|p| p.rx_bytes)),
             )
         } else {
             // Fallback: Pick a single link to source the GPU-wide TX/RX aggregate from.
@@ -956,35 +1000,29 @@ fn compute_nvlink_throughputs(
                 Some(link) => {
                     let prev_link =
                         prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
-                    let curr_tx = link.tx_bytes.unwrap_or(0);
-                    let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
-                    let curr_rx = link.rx_bytes.unwrap_or(0);
-                    let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
                     (
-                        curr_tx.saturating_sub(prev_tx),
-                        curr_rx.saturating_sub(prev_rx),
+                        delta(link.tx_bytes, prev_link.and_then(|l| l.tx_bytes)),
+                        delta(link.rx_bytes, prev_link.and_then(|l| l.rx_bytes)),
                     )
                 }
                 None => (0, 0),
             }
         };
 
-        // Compute individual link rates in bytes per second to store in the metadata links
+        // Compute individual link rates in bytes per second to store in the
+        // metadata links. `None` counters stay `None` so the detail pane can
+        // use its GPU-aggregate fallback instead of showing a false 0.
+        let rate = |c: Option<u64>, p: Option<u64>| -> Option<u64> {
+            c.map(|_| (delta(c, p) as f64 / elapsed) as u64)
+        };
         let mut links = Vec::with_capacity(gpu.links.len());
         for link in &gpu.links {
             let prev_link =
                 prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
-            let curr_tx = link.tx_bytes.unwrap_or(0);
-            let prev_tx = prev_link.and_then(|l| l.tx_bytes).unwrap_or(0);
-            let curr_rx = link.rx_bytes.unwrap_or(0);
-            let prev_rx = prev_link.and_then(|l| l.rx_bytes).unwrap_or(0);
-
-            let rate_tx = (curr_tx.saturating_sub(prev_tx) as f64 / elapsed) as u64;
-            let rate_rx = (curr_rx.saturating_sub(prev_rx) as f64 / elapsed) as u64;
 
             let mut link_clone = link.clone();
-            link_clone.tx_bytes = Some(rate_tx);
-            link_clone.rx_bytes = Some(rate_rx);
+            link_clone.tx_bytes = rate(link.tx_bytes, prev_link.and_then(|l| l.tx_bytes));
+            link_clone.rx_bytes = rate(link.rx_bytes, prev_link.and_then(|l| l.rx_bytes));
             links.push(link_clone);
         }
 
@@ -993,35 +1031,41 @@ fn compute_nvlink_throughputs(
                 prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
 
             if let Some(v) = link.crc_error_count {
-                let prev_v = prev_link.and_then(|l| l.crc_error_count).unwrap_or(0);
-                let delta = v.saturating_sub(prev_v);
+                let d = delta(
+                    link.crc_error_count,
+                    prev_link.and_then(|l| l.crc_error_count),
+                );
                 counter_rates.push(CounterRate {
                     name: format!("nvlink_crc_l{}", link.link_id),
                     value: v,
-                    delta,
-                    rate: delta as f64 / elapsed,
+                    delta: d,
+                    rate: d as f64 / elapsed,
                     is_bytes: false,
                 });
             }
             if let Some(v) = link.replay_error_count {
-                let prev_v = prev_link.and_then(|l| l.replay_error_count).unwrap_or(0);
-                let delta = v.saturating_sub(prev_v);
+                let d = delta(
+                    link.replay_error_count,
+                    prev_link.and_then(|l| l.replay_error_count),
+                );
                 counter_rates.push(CounterRate {
                     name: format!("nvlink_replay_l{}", link.link_id),
                     value: v,
-                    delta,
-                    rate: delta as f64 / elapsed,
+                    delta: d,
+                    rate: d as f64 / elapsed,
                     is_bytes: false,
                 });
             }
             if let Some(v) = link.recovery_error_count {
-                let prev_v = prev_link.and_then(|l| l.recovery_error_count).unwrap_or(0);
-                let delta = v.saturating_sub(prev_v);
+                let d = delta(
+                    link.recovery_error_count,
+                    prev_link.and_then(|l| l.recovery_error_count),
+                );
                 counter_rates.push(CounterRate {
                     name: format!("nvlink_recovery_l{}", link.link_id),
                     value: v,
-                    delta,
-                    rate: delta as f64 / elapsed,
+                    delta: d,
+                    rate: d as f64 / elapsed,
                     is_bytes: false,
                 });
             }
@@ -1045,9 +1089,263 @@ fn compute_nvlink_throughputs(
                 active_links: active,
                 links,
             }),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         });
     }
     out
+}
+
+/// Compute one `PortThroughput` row per GPU from a pair of XGMI snapshots.
+/// amdsmi reports true per-link accumulators, so GPU totals are the sum of
+/// per-link deltas; meta links carry per-second byte rates for the pane.
+#[cfg(feature = "xgmi")]
+fn compute_xgmi_throughputs(
+    prev: &[crate::xgmi::XgmiSnapshot],
+    curr: &[crate::xgmi::XgmiSnapshot],
+    elapsed: f64,
+) -> Vec<PortThroughput> {
+    let mut out = Vec::with_capacity(curr.len());
+    for gpu in curr {
+        let prev_gpu = prev.iter().find(|p| p.gpu_index == gpu.gpu_index);
+
+        let mut tx_total: u64 = 0;
+        let mut rx_total: u64 = 0;
+        let mut links = Vec::with_capacity(gpu.links.len());
+        // Both samples must exist to diff: a link or counter reappearing
+        // after a gap would otherwise diff its lifetime TB-scale
+        // accumulator against zero and render an absurd rate spike.
+        let delta = |c: Option<u64>, p: Option<u64>| match (c, p) {
+            (Some(c), Some(p)) => c.saturating_sub(p),
+            _ => 0,
+        };
+        for link in &gpu.links {
+            let prev_link =
+                prev_gpu.and_then(|p| p.links.iter().find(|l| l.link_id == link.link_id));
+            let (tx_delta, rx_delta) = match prev_link {
+                Some(pl) => (
+                    delta(link.tx_bytes, pl.tx_bytes),
+                    delta(link.rx_bytes, pl.rx_bytes),
+                ),
+                None => (0, 0),
+            };
+            tx_total = tx_total.saturating_add(tx_delta);
+            rx_total = rx_total.saturating_add(rx_delta);
+
+            // Keep "no counter data" as None so the pane can show "-"
+            // instead of a fabricated 0.0 rate.
+            let mut link_rate = link.clone();
+            link_rate.tx_bytes = link.tx_bytes.map(|_| (tx_delta as f64 / elapsed) as u64);
+            link_rate.rx_bytes = link.rx_bytes.map(|_| (rx_delta as f64 / elapsed) as u64);
+            links.push(link_rate);
+        }
+
+        let mut counter_rates: Vec<CounterRate> = Vec::new();
+        if let Some(v) = gpu.correctable_errors {
+            // Missing prev => zero delta, same convention as the byte
+            // counters above (the accumulated total still shows in `value`).
+            let delta = match prev_gpu.and_then(|p| p.correctable_errors) {
+                Some(prev_v) => v.saturating_sub(prev_v),
+                None => 0,
+            };
+            counter_rates.push(CounterRate {
+                name: "xgmi_wafl_ce".to_string(),
+                value: v,
+                delta,
+                rate: delta as f64 / elapsed,
+                is_bytes: false,
+            });
+        }
+        if let Some(v) = gpu.uncorrectable_errors {
+            let delta = match prev_gpu.and_then(|p| p.uncorrectable_errors) {
+                Some(prev_v) => v.saturating_sub(prev_v),
+                None => 0,
+            };
+            counter_rates.push(CounterRate {
+                name: "xgmi_wafl_ue".to_string(),
+                value: v,
+                delta,
+                rate: delta as f64 / elapsed,
+                is_bytes: false,
+            });
+        }
+
+        let active = gpu.active_links();
+        out.push(PortThroughput {
+            dev_name: format!("amdgpu{}", gpu.gpu_index),
+            port: active,
+            link_gbps: gpu.link_gbps,
+            tx_gbps: bytes_to_gbps(tx_total as f64 / elapsed),
+            rx_gbps: bytes_to_gbps(rx_total as f64 / elapsed),
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates,
+            port_label: Some(format!("{}/{}", active, gpu.link_count)),
+            #[cfg(feature = "nvlink")]
+            nvlink: None,
+            xgmi: Some(XgmiThroughputMeta {
+                gpu_index: gpu.gpu_index,
+                gpu_name: gpu.gpu_name.clone(),
+                active_links: active,
+                links,
+            }),
+        });
+    }
+    out
+}
+
+#[cfg(all(test, feature = "xgmi"))]
+mod xgmi_tests {
+    use super::*;
+    use crate::xgmi::{XgmiLinkSnapshot, XgmiSnapshot};
+
+    fn mk_link(id: u32, active: bool, tx: u64, rx: u64) -> XgmiLinkSnapshot {
+        XgmiLinkSnapshot {
+            link_id: id,
+            is_active: active,
+            speed_gbps: Some(512.0),
+            bit_rate_gbps: Some(32.0),
+            remote_pci_bdf: Some(format!("0000:0{}:00.0", id + 1)),
+            tx_bytes: Some(tx),
+            rx_bytes: Some(rx),
+        }
+    }
+
+    fn mk_gpu(index: u32, links: Vec<XgmiLinkSnapshot>) -> XgmiSnapshot {
+        let active: u32 = links.iter().filter(|l| l.is_active).count() as u32;
+        XgmiSnapshot {
+            gpu_index: index,
+            gpu_name: "MI325X".to_string(),
+            link_count: links.len() as u32,
+            link_gbps: Some(512.0 * active as f64),
+            correctable_errors: Some(0),
+            uncorrectable_errors: Some(0),
+            links,
+        }
+    }
+
+    #[test]
+    fn totals_are_sum_of_link_deltas() {
+        let prev = vec![mk_gpu(
+            0,
+            vec![mk_link(0, true, 1000, 2000), mk_link(1, true, 500, 500)],
+        )];
+        let curr = vec![mk_gpu(
+            0,
+            vec![mk_link(0, true, 3000, 6000), mk_link(1, true, 1500, 1500)],
+        )];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.dev_name, "amdgpu0");
+        // tx delta = (3000-1000)+(1500-500) = 3000 B/s; rx = 4000+1000 = 5000 B/s
+        assert!((row.tx_gbps - bytes_to_gbps(3000.0)).abs() < 1e-12);
+        assert!((row.rx_gbps - bytes_to_gbps(5000.0)).abs() < 1e-12);
+        assert_eq!(row.port_label.as_deref(), Some("2/2"));
+        // meta links carry per-second rates now
+        let meta = row.xgmi.as_ref().expect("xgmi meta present");
+        assert_eq!(meta.links[0].tx_bytes, Some(2000));
+        assert_eq!(meta.links[0].rx_bytes, Some(4000));
+        assert_eq!(meta.links[1].tx_bytes, Some(1000));
+        assert_eq!(meta.links[1].rx_bytes, Some(1000));
+    }
+
+    #[test]
+    fn unseen_gpu_emits_zero_rates() {
+        // A GPU with no prior sample must not diff its lifetime accumulator
+        // against zero (would render an absurd spike mid-run).
+        let curr = vec![mk_gpu(0, vec![mk_link(0, true, 4096, 8192)])];
+        let rows = compute_xgmi_throughputs(&[], &curr, 2.0);
+        let row = &rows[0];
+        assert_eq!(row.tx_gbps, 0.0);
+        assert_eq!(row.rx_gbps, 0.0);
+        let meta = row.xgmi.as_ref().expect("xgmi meta present");
+        assert_eq!(meta.links[0].tx_bytes, Some(0));
+        assert_eq!(meta.links[0].rx_bytes, Some(0));
+    }
+
+    #[test]
+    fn counter_reappearing_after_gap_emits_zero() {
+        // prev sample exists but carried no counter data: diffing the
+        // reappeared lifetime accumulator against zero must not spike.
+        let mut prev_link = mk_link(0, true, 0, 0);
+        prev_link.tx_bytes = None;
+        prev_link.rx_bytes = None;
+        let prev = vec![mk_gpu(0, vec![prev_link])];
+        let curr = vec![mk_gpu(
+            0,
+            vec![mk_link(0, true, u64::MAX / 2, u64::MAX / 2)],
+        )];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        assert_eq!(rows[0].tx_gbps, 0.0);
+        assert_eq!(rows[0].rx_gbps, 0.0);
+    }
+
+    #[test]
+    fn missing_counters_stay_none() {
+        // Peers without accumulator data must not fabricate 0.0 rates.
+        let mut link = mk_link(0, true, 0, 0);
+        link.tx_bytes = None;
+        link.rx_bytes = None;
+        let prev = vec![mk_gpu(0, vec![link.clone()])];
+        let curr = vec![mk_gpu(0, vec![link])];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        let meta = rows[0].xgmi.as_ref().expect("xgmi meta present");
+        assert_eq!(meta.links[0].tx_bytes, None);
+        assert_eq!(meta.links[0].rx_bytes, None);
+    }
+
+    #[test]
+    fn counter_going_backwards_clamps_to_zero() {
+        let prev = vec![mk_gpu(0, vec![mk_link(0, true, 9999, 9999)])];
+        let curr = vec![mk_gpu(0, vec![mk_link(0, true, 1, 1)])];
+        let rows = compute_xgmi_throughputs(&prev, &curr, 1.0);
+        assert_eq!(rows[0].tx_gbps, 0.0);
+        assert_eq!(rows[0].rx_gbps, 0.0);
+    }
+
+    #[test]
+    fn inactive_links_excluded_from_active_count() {
+        let curr = vec![mk_gpu(
+            0,
+            vec![mk_link(0, true, 0, 0), mk_link(1, false, 0, 0)],
+        )];
+        let rows = compute_xgmi_throughputs(&[], &curr, 1.0);
+        assert_eq!(rows[0].port, 1);
+        assert_eq!(rows[0].port_label.as_deref(), Some("1/2"));
+    }
+
+    #[test]
+    fn wafl_error_counters_emitted_with_deltas() {
+        let mut prev_gpu = mk_gpu(0, vec![mk_link(0, true, 0, 0)]);
+        prev_gpu.correctable_errors = Some(5);
+        prev_gpu.uncorrectable_errors = Some(1);
+        let mut curr_gpu = mk_gpu(0, vec![mk_link(0, true, 0, 0)]);
+        curr_gpu.correctable_errors = Some(8);
+        curr_gpu.uncorrectable_errors = Some(1);
+        let rows = compute_xgmi_throughputs(&[prev_gpu], &[curr_gpu], 1.0);
+        let ce = rows[0]
+            .counter_rates
+            .iter()
+            .find(|c| c.name == "xgmi_wafl_ce")
+            .unwrap();
+        assert_eq!(ce.value, 8);
+        assert_eq!(ce.delta, 3);
+        let ue = rows[0]
+            .counter_rates
+            .iter()
+            .find(|c| c.name == "xgmi_wafl_ue")
+            .unwrap();
+        assert_eq!(ue.value, 1);
+        assert_eq!(ue.delta, 0);
+    }
+
+    #[test]
+    fn throughput_key_uses_dev_name_for_xgmi_rows() {
+        let rows = compute_xgmi_throughputs(&[], &[mk_gpu(3, vec![mk_link(0, true, 0, 0)])], 1.0);
+        assert_eq!(throughput_key(&rows[0]), "amdgpu3");
+    }
 }
 
 #[cfg(all(test, feature = "nvlink"))]
@@ -1269,7 +1567,9 @@ mod nvlink_tests {
     }
 
     #[test]
-    fn missing_prev_snapshot_treats_curr_as_delta() {
+    fn missing_prev_snapshot_emits_zero_rates() {
+        // NVML counters are cumulative since driver load: a GPU with no
+        // prior sample must not diff them against zero (rate spike).
         let elapsed = 2.0_f64;
         let curr = vec![NvLinkSnapshot {
             gpu_index: 1,
@@ -1286,10 +1586,8 @@ mod nvlink_tests {
         let row = &rows[0];
         assert_eq!(row.dev_name, "nvidia1");
         assert_eq!(row.port_label.as_deref(), Some("1/1"));
-        let expected_tx = 2_000_000_000.0_f64 * 8.0 / 1_000_000_000.0 / elapsed;
-        let expected_rx = 1_000_000_000.0_f64 * 8.0 / 1_000_000_000.0 / elapsed;
-        assert!((row.tx_gbps - expected_tx).abs() < 1e-6);
-        assert!((row.rx_gbps - expected_rx).abs() < 1e-6);
+        assert_eq!(row.tx_gbps, 0.0);
+        assert_eq!(row.rx_gbps, 0.0);
     }
 
     #[test]
@@ -1595,6 +1893,8 @@ mod nvlink_tests {
                 active_links: 2,
                 links: Vec::new(),
             }),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let rdma_a_ref = PortThroughput {
             dev_name: "mlx5_0".to_string(),
@@ -1609,6 +1909,8 @@ mod nvlink_tests {
             port_label: None,
             #[cfg(feature = "nvlink")]
             nvlink: None,
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let rdma_b_ref = PortThroughput {
             dev_name: "mlx5_1".to_string(),
@@ -1623,6 +1925,8 @@ mod nvlink_tests {
             port_label: None,
             #[cfg(feature = "nvlink")]
             nvlink: None,
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let reference = vec![rdma_a_ref.clone(), nvlink_ref.clone(), rdma_b_ref.clone()];
         let nvlink_ref_pos = 1usize;
@@ -1647,6 +1951,8 @@ mod nvlink_tests {
                 active_links: 3,
                 links: Vec::new(),
             }),
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let rdma_a_avg = PortThroughput {
             dev_name: "mlx5_0".to_string(),
@@ -1661,6 +1967,8 @@ mod nvlink_tests {
             port_label: None,
             #[cfg(feature = "nvlink")]
             nvlink: None,
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let rdma_b_avg = PortThroughput {
             dev_name: "mlx5_1".to_string(),
@@ -1675,6 +1983,8 @@ mod nvlink_tests {
             port_label: None,
             #[cfg(feature = "nvlink")]
             nvlink: None,
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         };
         let mut avgs = vec![rdma_b_avg.clone(), nvlink_avg.clone(), rdma_a_avg.clone()];
 
@@ -1715,6 +2025,8 @@ mod sort_tests {
             port_label: None,
             #[cfg(feature = "nvlink")]
             nvlink: None,
+            #[cfg(feature = "xgmi")]
+            xgmi: None,
         }
     }
 
