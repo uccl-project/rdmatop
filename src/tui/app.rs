@@ -15,6 +15,17 @@ pub enum DeviceClass {
     Nvlink,
 }
 
+impl DeviceClass {
+    /// Display name used by the tab bar, header, and table titles.
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeviceClass::Rdma => "RDMA",
+            DeviceClass::Xgmi => "XGMI",
+            DeviceClass::Nvlink => "NVLink",
+        }
+    }
+}
+
 /// Per-port computed throughput (delta / interval).
 #[derive(Clone, Debug)]
 pub struct PortThroughput {
@@ -762,6 +773,8 @@ impl App {
         self.selected_row = *self.tab_selection.get(&self.active_tab).unwrap_or(&0);
         self.table_offset = 0;
         self.h_scroll = 0;
+        // Tab also works with the detail pane open; start it at the top.
+        self.detail_scroll = 0;
         self.recompute_display();
     }
 }

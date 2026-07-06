@@ -141,11 +141,7 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
         app.theme.label()
     );
 
-    let label = match app.active_tab {
-        DeviceClass::Rdma => "RDMA",
-        DeviceClass::Xgmi => "XGMI",
-        DeviceClass::Nvlink => "NVLink",
-    };
+    let label = app.active_tab.label();
     Line::from(vec![
         styled(
             &format!(" {}: {} device{}", label, n, if n == 1 { "" } else { "s" }),
@@ -235,18 +231,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// One-line tab bar: ` RDMA │ XGMI │ NVLINK `, active tab highlighted.
+/// One-line tab bar: ` RDMA │ XGMI │ NVLink `, active tab highlighted.
 fn tab_bar_line(app: &App, tc: &ThemeColors) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![styled(" ", tc.muted, false)];
     for (i, tab) in app.seen_tabs.iter().enumerate() {
         if i > 0 {
             spans.push(styled(" │ ", tc.muted, false));
         }
-        let label = match tab {
-            DeviceClass::Rdma => "RDMA",
-            DeviceClass::Xgmi => "XGMI",
-            DeviceClass::Nvlink => "NVLINK",
-        };
+        let label = tab.label();
         if *tab == app.active_tab {
             spans.push(Span::styled(
                 format!(" {} ", label),
@@ -387,11 +379,7 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
 /// h-scroll and the column picker are RDMA-only; this function ignores both.
 fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let display = app.display_throughputs().to_vec();
-    let label = match app.active_tab {
-        DeviceClass::Xgmi => "XGMI",
-        DeviceClass::Nvlink => "NVLink",
-        DeviceClass::Rdma => "RDMA",
-    };
+    let label = app.active_tab.label();
     let title = if app.show_rolling_avg {
         format!(
             " {} Throughput (avg {}s) ",
