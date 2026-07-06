@@ -84,6 +84,11 @@ communication benchmarks:
 3. **Process detection** — `RDMA_NLDEV_CMD_RES_QP_GET` to map QPs → PIDs, enriched with `/proc` data
 4. **Throughput** — Two snapshots per interval, delta / elapsed for rates
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test instructions,
+design ground rules, and how to submit changes.
+
 ## License
 
 Apache-2.0
