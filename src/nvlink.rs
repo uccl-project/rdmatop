@@ -1,10 +1,9 @@
 //! NVLink data layer built on top of the NVIDIA Management Library (NVML).
 //!
-//! This module is only compiled when the `nvlink` cargo feature is enabled.
-//! It exposes a small snapshot type that the TUI can render without having to
-//! link directly against NVML. Per-link TX/RX throughput is read via the raw
-//! `nvmlDeviceGetFieldValues` entry point because `nvml-wrapper` does not
-//! currently expose a safe helper for those field IDs.
+//! NVML is loaded at runtime by `nvml-wrapper`; on hosts without the NVIDIA
+//! driver `read_all_nvlink_stats` returns an empty vector. Per-link TX/RX
+//! throughput is read via the raw `nvmlDeviceGetFieldValues` entry point
+//! because `nvml-wrapper` does not expose a safe helper for those field IDs.
 
 use std::io;
 

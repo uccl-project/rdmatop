@@ -52,6 +52,8 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Right => app.scroll_right(),
         KeyCode::Enter => app.toggle_detail(),
         KeyCode::Char('t') => app.cycle_theme(),
+        KeyCode::Tab => app.cycle_tab(true),
+        KeyCode::BackTab => app.cycle_tab(false),
         KeyCode::Char('a') => app.toggle_rolling_avg(),
         KeyCode::Char('+') | KeyCode::Char('=') => app.increase_avg_window(),
         KeyCode::Char('-') => app.decrease_avg_window(),

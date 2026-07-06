@@ -10,7 +10,8 @@ use ratatui::{
 };
 
 use super::app::{
-    all_columns, App, CounterRate, PortThroughput, TableColumn, BAR_WIDTH, EXTRA_COUNTERS,
+    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, BAR_WIDTH,
+    EXTRA_COUNTERS,
 };
 use super::theme::ThemeColors;
 
@@ -21,6 +22,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Enter", "Toggle detail panel"),
     ("Esc", "Close detail / quit"),
     ("t", "Cycle theme"),
+    ("Tab / S-Tab", "Switch device class (RDMA/XGMI/NVLink)"),
     ("a", "Toggle rolling average"),
     ("+ / =", "Increase avg window (+1s)"),
     ("-", "Decrease avg window (-1s)"),
@@ -50,18 +52,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-
-    draw_header(frame, app, chunks[0], &tc);
-    draw_body(frame, app, chunks[1], &tc);
-    draw_status_bar(frame, app, chunks[2], &tc);
+    if app.seen_tabs.len() >= 2 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        draw_header(frame, app, chunks[0], &tc);
+        draw_tab_bar(frame, app, chunks[1], &tc);
+        draw_body(frame, app, chunks[2], &tc);
+        draw_status_bar(frame, app, chunks[3], &tc);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        draw_header(frame, app, chunks[0], &tc);
+        draw_body(frame, app, chunks[1], &tc);
+        draw_status_bar(frame, app, chunks[2], &tc);
+    }
 
     if app.show_help {
         draw_help_popup(frame, &tc);
@@ -130,9 +147,14 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
         app.theme.label()
     );
 
+    let label = match app.active_tab {
+        DeviceClass::Rdma => "RDMA",
+        DeviceClass::Xgmi => "XGMI",
+        DeviceClass::Nvlink => "NVLink",
+    };
     Line::from(vec![
         styled(
-            &format!(" RDMA: {} device{}", n, if n == 1 { "" } else { "s" }),
+            &format!(" {}: {} device{}", label, n, if n == 1 { "" } else { "s" }),
             tc.fg,
             false,
         ),
@@ -219,6 +241,37 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// One-line tab bar: ` RDMA │ XGMI │ NVLINK `, active tab highlighted.
+fn tab_bar_line(app: &App, tc: &ThemeColors) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![styled(" ", tc.muted, false)];
+    for (i, tab) in app.seen_tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(styled(" │ ", tc.muted, false));
+        }
+        let label = match tab {
+            DeviceClass::Rdma => "RDMA",
+            DeviceClass::Xgmi => "XGMI",
+            DeviceClass::Nvlink => "NVLINK",
+        };
+        if *tab == app.active_tab {
+            spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(tc.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(styled(&format!(" {} ", label), tc.muted, false));
+        }
+    }
+    Line::from(spans)
+}
+
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    frame.render_widget(Paragraph::new(tab_bar_line(app, tc)), area);
+}
+
 fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
     // Scale to the port's line rate; fall back to a default when unknown.
     let max = link_gbps.filter(|&r| r > 0.0).unwrap_or(RDMA_LINK_GBPS);
@@ -280,7 +333,165 @@ fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<
     }
 }
 
+/// Marketing name from whichever GPU meta the row carries.
+fn gpu_meta_name(t: &PortThroughput) -> String {
+    if let Some(ref m) = t.xgmi {
+        return m.gpu_name.clone();
+    }
+    if let Some(ref m) = t.nvlink {
+        return m.gpu_name.clone();
+    }
+    String::new()
+}
+
+/// XGMI: "ce/ue". NVLink: single summed nvlink_* error total.
+fn gpu_errs(t: &PortThroughput) -> String {
+    let counter = |name: &str| {
+        t.counter_rates
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.value)
+            .unwrap_or(0)
+    };
+    if t.xgmi.is_some() {
+        return format!("{}/{}", counter("xgmi_wafl_ce"), counter("xgmi_wafl_ue"));
+    }
+    let sum: u64 = t
+        .counter_rates
+        .iter()
+        .filter(|c| c.name.starts_with("nvlink_"))
+        .map(|c| c.value)
+        .sum();
+    sum.to_string()
+}
+
+fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
+    let speed = t
+        .link_gbps
+        .map(|g| format!("{:.0}", g))
+        .unwrap_or_else(|| "-".to_string());
+    // Bar and Gbps live in separate cells styled with gbps_color, exactly
+    // like the RDMA table, so the two tabs stay visually aligned.
+    vec![
+        Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
+        Cell::from(gpu_meta_name(t)).style(Style::default().fg(tc.muted)),
+        Cell::from(t.port_label.clone().unwrap_or_default()).style(Style::default().fg(tc.fg)),
+        Cell::from(speed).style(Style::default().fg(tc.fg)),
+        Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
+            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
+        Cell::from(format!("{:.2}", t.tx_gbps))
+            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
+        Cell::from(gbps_bar(t.rx_gbps, t.link_gbps))
+            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+        Cell::from(format!("{:.2}", t.rx_gbps))
+            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+        Cell::from(gpu_errs(t)).style(Style::default().fg(tc.warning)),
+    ]
+}
+
+/// GPU-tab table: fixed columns for XGMI / NVLink rows.
+/// h-scroll and the column picker are RDMA-only; this function ignores both.
+fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
+    let display = app.display_throughputs().to_vec();
+    let label = match app.active_tab {
+        DeviceClass::Xgmi => "XGMI",
+        DeviceClass::Nvlink => "NVLink",
+        DeviceClass::Rdma => "RDMA",
+    };
+    let title = if app.show_rolling_avg {
+        format!(
+            " {} Throughput (avg {}s) ",
+            label, app.rolling_avg.window_secs
+        )
+    } else {
+        format!(" {} Throughput ", label)
+    };
+
+    let header = Row::new(vec![
+        "Device", "Name", "Links", "Speed", "TX", "Gbps", "RX", "Gbps", "Errs",
+    ])
+    .style(
+        Style::default()
+            .fg(tc.header_fg)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
+
+    let rows: Vec<Row> = display
+        .iter()
+        .map(|t| Row::new(gpu_row_cells(t, tc)))
+        .collect();
+
+    // Shared columns copy the RDMA table's widths (Device 16, bars
+    // BAR_WIDTH, Gbps 9) so switching tabs doesn't shift the layout.
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(22),
+        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(BAR_WIDTH as u16),
+        Constraint::Length(9),
+        Constraint::Length(BAR_WIDTH as u16),
+        Constraint::Length(9),
+        Constraint::Length(9),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(tc.border))
+                .title(title)
+                .title_style(Style::default().fg(tc.accent)),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(tc.highlight_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    let mut state = TableState::default();
+    if !display.is_empty() {
+        let viewport = area.height.saturating_sub(4) as usize;
+        if viewport > 0 {
+            if app.selected_row >= app.table_offset + viewport {
+                app.table_offset = app.selected_row + 1 - viewport;
+            } else if app.selected_row < app.table_offset {
+                app.table_offset = app.selected_row;
+            }
+        }
+        state.select(Some(app.selected_row));
+        *state.offset_mut() = app.table_offset;
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if display.len() > area.height.saturating_sub(4) as usize {
+        let mut v_scroll = ScrollbarState::new(display.len()).position(app.selected_row);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("▐")
+                .track_symbol(Some("│"))
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_style(Style::default().fg(tc.accent))
+                .track_style(Style::default().fg(tc.border)),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut v_scroll,
+        );
+    }
+}
+
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
+    if app.active_tab != DeviceClass::Rdma {
+        draw_gpu_table(frame, app, area, tc);
+        return;
+    }
+
     let display = app.display_throughputs().to_vec();
     let title = if app.show_rolling_avg {
         format!(" RDMA Throughput (avg {}s) ", app.rolling_avg.window_secs)
@@ -333,13 +544,18 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         (visible, true)
     };
 
-    let header = Row::new(cols_to_render.iter().map(|c| c.label()).collect::<Vec<_>>())
-        .style(
-            Style::default()
-                .fg(tc.header_fg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .height(1);
+    let header = Row::new(
+        cols_to_render
+            .iter()
+            .map(|c| c.header_label())
+            .collect::<Vec<_>>(),
+    )
+    .style(
+        Style::default()
+            .fg(tc.header_fg)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
 
     let rows: Vec<Row> = display
         .iter()
@@ -465,13 +681,8 @@ fn build_detail_lines(
 
 /// Build the per-lane detail panel for a NVLink GPU row.
 ///
-/// Layout:
-///   Device: nvidiaN  [NVLink]  active/total active
-///   TX/RX aggregate Gbps with sparkline
-///   Lane table header (Lane, State, Ver, TX MB/s, RX MB/s, Remote)
-///   One row per link, including inactive lanes
-///   Summed error counters (replay/recovery/crc)
-#[cfg(feature = "nvlink")]
+/// Layout: header, TX/RX sparklines, lane table (Lane, State, Ver,
+/// TX MB/s, RX MB/s, Remote), summed error counters.
 fn build_nvlink_detail_lines(
     t: &PortThroughput,
     meta: &super::app::NvLinkThroughputMeta,
@@ -602,7 +813,6 @@ fn build_nvlink_detail_lines(
 /// Build the per-link detail panel for an XGMI GPU row.
 /// Layout mirrors the NVLink pane: header, TX/RX sparklines, a link table
 /// (Link, State, Gbps, TX MB/s, RX MB/s, Remote), then XGMI_WAFL ECC counts.
-#[cfg(feature = "xgmi")]
 fn build_xgmi_detail_lines(
     t: &PortThroughput,
     meta: &super::app::XgmiThroughputMeta,
@@ -827,11 +1037,9 @@ fn build_selected_detail_lines(
     show_avg: bool,
     avg_window: usize,
 ) -> Vec<Line<'static>> {
-    #[cfg(feature = "nvlink")]
     if let Some(ref meta) = t.nvlink {
         return build_nvlink_detail_lines(t, meta, history, tc, show_avg, avg_window);
     }
-    #[cfg(feature = "xgmi")]
     if let Some(ref meta) = t.xgmi {
         return build_xgmi_detail_lines(t, meta, history, tc, show_avg, avg_window);
     }
@@ -1154,7 +1362,58 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-#[cfg(all(test, feature = "nvlink"))]
+#[cfg(test)]
+mod tab_bar_tests {
+    use super::*;
+    use crate::tui::app::{App, DeviceClass};
+    use crate::tui::theme::Theme;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tab_bar_shows_all_seen_tabs() {
+        let mut app = App::new();
+        app.seen_tabs = vec![DeviceClass::Rdma, DeviceClass::Xgmi];
+        app.active_tab = DeviceClass::Rdma;
+        let tc = Theme::Default.colors();
+        let bar = tab_bar_line(&app, &tc);
+        let text = line_text(&bar);
+        assert!(text.contains("RDMA"), "bar: {text:?}");
+        assert!(text.contains("XGMI"), "bar: {text:?}");
+        assert!(text.contains('│'), "bar: {text:?}");
+    }
+
+    #[test]
+    fn active_tab_is_highlighted() {
+        let mut app = App::new();
+        app.seen_tabs = vec![DeviceClass::Rdma, DeviceClass::Xgmi];
+        app.active_tab = DeviceClass::Xgmi;
+        let tc = Theme::Default.colors();
+        let bar = tab_bar_line(&app, &tc);
+        let xgmi_span = bar
+            .spans
+            .iter()
+            .find(|s| s.content.contains("XGMI"))
+            .expect("XGMI span");
+        let rdma_span = bar
+            .spans
+            .iter()
+            .find(|s| s.content.contains("RDMA"))
+            .expect("RDMA span");
+        assert!(
+            xgmi_span.style.add_modifier.contains(Modifier::BOLD),
+            "active XGMI span should be bold"
+        );
+        assert!(
+            !rdma_span.style.add_modifier.contains(Modifier::BOLD),
+            "inactive RDMA span should not be bold"
+        );
+    }
+}
+
+#[cfg(test)]
 mod nvlink_detail_tests {
     use super::*;
     use crate::nvlink::{LinkSnapshot, RemoteDeviceType};
@@ -1240,8 +1499,8 @@ mod nvlink_detail_tests {
             counter_rates,
             port_label: Some(format!("{}/{}", active, links.len())),
             nvlink: Some(meta.clone()),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         };
         (port, meta)
     }
@@ -1530,8 +1789,8 @@ mod nvlink_detail_tests {
             counter_rates: Vec::new(),
             port_label: Some("2/3".to_string()),
             nvlink: Some(meta.clone()),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         };
 
         let tc = Theme::Default.colors();
@@ -1639,8 +1898,8 @@ mod nvlink_detail_tests {
             counter_rates: Vec::new(),
             port_label: Some("2/2".to_string()),
             nvlink: Some(meta.clone()),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         };
 
         let tc = Theme::Default.colors();
@@ -1678,7 +1937,7 @@ mod nvlink_detail_tests {
     }
 }
 
-#[cfg(all(test, feature = "xgmi"))]
+#[cfg(test)]
 mod xgmi_detail_tests {
     use super::*;
     use crate::tui::app::{PortThroughput, XgmiThroughputMeta};
@@ -1735,9 +1994,9 @@ mod xgmi_detail_tests {
                 },
             ],
             port_label: Some(format!("{}/{}", active, meta.links.len())),
-            #[cfg(feature = "nvlink")]
             nvlink: None,
             xgmi: Some(meta.clone()),
+            class: DeviceClass::Xgmi,
         };
         (port, meta)
     }
@@ -1807,5 +2066,130 @@ mod xgmi_detail_tests {
             .expect("link row");
         // Both the TX and RX cells must show "-" (the BDF carries no dash).
         assert!(row.matches('-').count() >= 2, "row: {row:?}");
+    }
+}
+
+#[cfg(test)]
+mod gpu_table_tests {
+    use super::*;
+    use crate::tui::app::{CounterRate, DeviceClass, NvLinkThroughputMeta, XgmiThroughputMeta};
+
+    fn make_counter(name: &str, value: u64) -> CounterRate {
+        CounterRate {
+            name: name.to_string(),
+            value,
+            delta: 0,
+            rate: 0.0,
+            is_bytes: false,
+        }
+    }
+
+    fn xgmi_row(ce: u64, ue: u64) -> PortThroughput {
+        PortThroughput {
+            dev_name: "amdgpu0".to_string(),
+            port: 7,
+            link_gbps: Some(3584.0),
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: vec![
+                make_counter("xgmi_wafl_ce", ce),
+                make_counter("xgmi_wafl_ue", ue),
+            ],
+            port_label: Some("7/7".to_string()),
+            nvlink: None,
+            xgmi: Some(XgmiThroughputMeta {
+                gpu_index: 0,
+                gpu_name: "MI325X".to_string(),
+                active_links: 7,
+                links: vec![],
+            }),
+            class: DeviceClass::Xgmi,
+        }
+    }
+
+    fn nvlink_row(crc: u64, replay: u64) -> PortThroughput {
+        PortThroughput {
+            dev_name: "nvidia0".to_string(),
+            port: 18,
+            link_gbps: Some(900.0),
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: vec![
+                make_counter("nvlink_crc_l0", crc),
+                make_counter("nvlink_replay_l1", replay),
+            ],
+            port_label: Some("18/18".to_string()),
+            nvlink: Some(NvLinkThroughputMeta {
+                gpu_index: 0,
+                gpu_name: "H100".to_string(),
+                active_links: 18,
+                links: vec![],
+            }),
+            xgmi: None,
+            class: DeviceClass::Nvlink,
+        }
+    }
+
+    fn rdma_row() -> PortThroughput {
+        PortThroughput {
+            dev_name: "mlx5_0".to_string(),
+            port: 1,
+            link_gbps: Some(100.0),
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: vec![],
+            port_label: None,
+            nvlink: None,
+            xgmi: None,
+            class: DeviceClass::Rdma,
+        }
+    }
+
+    #[test]
+    fn gpu_meta_name_xgmi() {
+        assert_eq!(gpu_meta_name(&xgmi_row(7, 1)), "MI325X");
+    }
+
+    #[test]
+    fn gpu_meta_name_nvlink() {
+        assert_eq!(gpu_meta_name(&nvlink_row(2, 3)), "H100");
+    }
+
+    #[test]
+    fn gpu_meta_name_plain_rdma() {
+        assert_eq!(gpu_meta_name(&rdma_row()), "");
+    }
+
+    #[test]
+    fn gpu_errs_xgmi_ce_ue() {
+        assert_eq!(gpu_errs(&xgmi_row(7, 1)), "7/1");
+    }
+
+    #[test]
+    fn gpu_errs_xgmi_missing_counters() {
+        let mut row = xgmi_row(0, 0);
+        row.counter_rates.clear();
+        assert_eq!(gpu_errs(&row), "0/0");
+    }
+
+    #[test]
+    fn gpu_errs_nvlink_sum() {
+        assert_eq!(gpu_errs(&nvlink_row(2, 3)), "5");
+    }
+
+    #[test]
+    fn gpu_errs_nvlink_missing_counters() {
+        let mut row = nvlink_row(0, 0);
+        row.counter_rates.clear();
+        assert_eq!(gpu_errs(&row), "0");
     }
 }

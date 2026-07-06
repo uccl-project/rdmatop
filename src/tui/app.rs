@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
+/// Which hardware class a `PortThroughput` row belongs to; one TUI tab each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceClass {
+    Rdma,
+    Xgmi,
+    Nvlink,
+}
+
 /// Per-port computed throughput (delta / interval).
 #[derive(Clone, Debug)]
 pub struct PortThroughput {
@@ -22,36 +30,29 @@ pub struct PortThroughput {
     pub counter_rates: Vec<CounterRate>,
     /// Optional override for the Port column text. Used by NVLink rows.
     pub port_label: Option<String>,
-    /// NVLink metadata attached to this row. Populated by Task 3 and rendered
-    /// by the TUI detail pane when the `nvlink` feature is enabled.
-    #[cfg(feature = "nvlink")]
+    /// NVLink metadata attached to this row.
     pub nvlink: Option<NvLinkThroughputMeta>,
-    /// XGMI metadata attached to this row when the `xgmi` feature is enabled.
-    #[cfg(feature = "xgmi")]
+    /// XGMI metadata attached to this row.
     pub xgmi: Option<XgmiThroughputMeta>,
+    pub class: DeviceClass,
 }
 
-/// Per-GPU XGMI metadata attached to a `PortThroughput` row when the
-/// `xgmi` feature is enabled. Mirrors `NvLinkThroughputMeta`; `links[]`
+/// Per-GPU XGMI metadata. Mirrors `NvLinkThroughputMeta`; `links[]`
 /// tx/rx are rewritten as per-second byte rates for the detail pane.
-#[cfg(feature = "xgmi")]
 #[derive(Clone, Debug)]
 pub struct XgmiThroughputMeta {
     /// Not rendered yet (rows already show `amdgpu<index>` via `dev_name`);
     /// kept so future panels (e.g. topology graph) can reference it.
     #[allow(dead_code)]
     pub gpu_index: u32,
-    /// Marketing name (e.g. "AMD Instinct MI325X"); kept for future panels.
-    #[allow(dead_code)]
+    /// Marketing name (e.g. "AMD Instinct MI325X"); Name column on the tab.
     pub gpu_name: String,
     pub active_links: u32,
     pub links: Vec<crate::xgmi::XgmiLinkSnapshot>,
 }
 
-/// Per-GPU NVLink metadata attached to a `PortThroughput` row when the
-/// `nvlink` feature is enabled. The TUI uses this to show per-link details
+/// Per-GPU NVLink metadata. The TUI uses this to show per-link details
 /// and error counters in the detail pane.
-#[cfg(feature = "nvlink")]
 #[derive(Clone, Debug)]
 pub struct NvLinkThroughputMeta {
     /// GPU index reported by NVML. Not directly rendered by the TUI today
@@ -59,9 +60,7 @@ pub struct NvLinkThroughputMeta {
     /// but kept so future panels (e.g. topology graph) can reference it.
     #[allow(dead_code)]
     pub gpu_index: u32,
-    /// Marketing name of the GPU (e.g. "H100"). Currently unused by the
-    /// detail pane, which displays only the aggregate active/total counts.
-    #[allow(dead_code)]
+    /// Marketing name of the GPU (e.g. "H100"); Name column on the tab.
     pub gpu_name: String,
     pub active_links: u32,
     pub links: Vec<crate::nvlink::LinkSnapshot>,
@@ -105,6 +104,17 @@ impl TableColumn {
             Self::RxPps => "RX pps".into(),
             Self::Drops => "Drops/s".into(),
             Self::Counter(name) => name.clone(),
+        }
+    }
+
+    /// Table-header text: the bar column names the direction ("TX"/"RX")
+    /// and the value column next to it is just "Gbps" — no duplication.
+    pub fn header_label(&self) -> String {
+        match self {
+            Self::TxBar => "TX".into(),
+            Self::RxBar => "RX".into(),
+            Self::TxGbps | Self::RxGbps => "Gbps".into(),
+            _ => self.label(),
         }
     }
 
@@ -251,10 +261,9 @@ impl RollingAvgState {
             rx_drops_per_sec: window.iter().map(|s| s.rx_drops_per_sec).sum::<f64>() / n,
             counter_rates: Vec::new(),
             port_label: latest.port_label.clone(),
-            #[cfg(feature = "nvlink")]
             nvlink: latest.nvlink.clone(),
-            #[cfg(feature = "xgmi")]
             xgmi: latest.xgmi.clone(),
+            class: latest.class,
         };
         if let Some(template) = window.last() {
             avg.counter_rates = template
@@ -353,10 +362,11 @@ pub struct App {
     pub recorder: Option<Recorder>,
     /// Transient message shown after a recording is saved or fails.
     pub record_status: Option<String>,
-    #[cfg(feature = "nvlink")]
     prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
-    #[cfg(feature = "xgmi")]
     prev_xgmi: Vec<crate::xgmi::XgmiSnapshot>,
+    pub active_tab: DeviceClass,
+    pub seen_tabs: Vec<DeviceClass>,
+    tab_selection: HashMap<DeviceClass, usize>,
 }
 
 const HISTORY_LEN: usize = 60;
@@ -431,13 +441,13 @@ impl App {
             cached_display: Vec::new(),
             recorder: None,
             record_status: None,
-            // Pre-read like prev_stats above: NVML/amdsmi counters are
-            // cumulative since driver load, so an empty baseline would
-            // render an absurd first-frame rate spike.
-            #[cfg(feature = "nvlink")]
+            // Pre-read like prev_stats: NVML/amdsmi counters are cumulative
+            // since driver load; an empty baseline causes a first-frame spike.
             prev_nvlink: crate::nvlink::read_all_nvlink_stats().unwrap_or_default(),
-            #[cfg(feature = "xgmi")]
             prev_xgmi: crate::xgmi::read_all_xgmi_stats().unwrap_or_default(),
+            active_tab: DeviceClass::Rdma,
+            seen_tabs: vec![DeviceClass::Rdma],
+            tab_selection: HashMap::new(),
         }
     }
 
@@ -453,7 +463,6 @@ impl App {
         self.throughputs = compute_throughputs(&self.prev_stats, &curr, elapsed);
         self.prev_stats = curr;
 
-        #[cfg(feature = "nvlink")]
         {
             let curr_nvlink = crate::nvlink::read_all_nvlink_stats().unwrap_or_default();
             let mut nvlink_rows =
@@ -462,7 +471,6 @@ impl App {
             self.prev_nvlink = curr_nvlink;
         }
 
-        #[cfg(feature = "xgmi")]
         {
             let curr_xgmi = crate::xgmi::read_all_xgmi_stats().unwrap_or_default();
             let mut xgmi_rows = compute_xgmi_throughputs(&self.prev_xgmi, &curr_xgmi, elapsed);
@@ -473,6 +481,7 @@ impl App {
         // Stable display order: sort once here so history, rolling averages,
         // recording, and the display all inherit the same order.
         sort_by_device_order(&mut self.throughputs);
+        detect_tabs(&mut self.seen_tabs, &self.throughputs);
 
         let curr_if = net::read_all_ifstats().unwrap_or_default();
         let net_rate = net::compute_net_rate(&self.prev_ifstats, &curr_if, elapsed);
@@ -495,15 +504,23 @@ impl App {
     }
 
     /// Recompute the cached display throughputs (call after any change to
-    /// `throughputs`, `show_rolling_avg`, or rolling avg state).
+    /// `throughputs`, `show_rolling_avg`, `active_tab`, or rolling avg state).
     fn recompute_display(&mut self) {
-        if self.show_rolling_avg {
+        let rows: Vec<PortThroughput> = if self.show_rolling_avg {
             let mut avgs = self.rolling_avg.averages();
             sort_by_throughput_order(&mut avgs, &self.throughputs);
-            self.cached_display = avgs;
+            avgs
         } else {
-            self.cached_display = self.throughputs.clone();
-        }
+            self.throughputs.clone()
+        };
+        self.cached_display = rows
+            .into_iter()
+            .filter(|t| t.class == self.active_tab)
+            .collect();
+        // Keep the cursor inside the (possibly shorter) filtered view.
+        self.selected_row = self
+            .selected_row
+            .min(self.cached_display.len().saturating_sub(1));
     }
 
     fn update_history(&mut self) {
@@ -526,7 +543,7 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        if !self.throughputs.is_empty() && self.selected_row < self.throughputs.len() - 1 {
+        if !self.cached_display.is_empty() && self.selected_row < self.cached_display.len() - 1 {
             self.selected_row += 1;
         }
     }
@@ -548,7 +565,9 @@ impl App {
     pub fn detail_scroll_down(&mut self, max: u16) {
         if self.detail_scroll < max {
             self.detail_scroll += 1;
-        } else if !self.throughputs.is_empty() && self.selected_row < self.throughputs.len() - 1 {
+        } else if !self.cached_display.is_empty()
+            && self.selected_row < self.cached_display.len() - 1
+        {
             self.selected_row += 1;
             self.detail_scroll = 0;
         }
@@ -640,6 +659,11 @@ impl App {
     }
 
     pub fn open_column_picker(&mut self) {
+        // Column layout is configurable only on the RDMA tab; GPU tabs
+        // render a fixed column set.
+        if self.active_tab != DeviceClass::Rdma {
+            return;
+        }
         self.show_column_picker = true;
         self.column_picker_cursor = 0;
     }
@@ -696,7 +720,7 @@ impl App {
     }
 
     pub fn selected_throughput(&self) -> Option<&PortThroughput> {
-        self.throughputs.get(self.selected_row)
+        self.cached_display.get(self.selected_row)
     }
 
     pub fn selected_device_processes(&self) -> Vec<&stat::ProcessRdmaInfo> {
@@ -710,8 +734,45 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
-        if !self.throughputs.is_empty() && self.selected_row >= self.throughputs.len() {
-            self.selected_row = self.throughputs.len() - 1;
+        if !self.cached_display.is_empty() && self.selected_row >= self.cached_display.len() {
+            self.selected_row = self.cached_display.len() - 1;
+        }
+    }
+
+    /// Cycle the active tab (Tab forward, Shift-Tab back); remembers the
+    /// cursor per tab and resets scroll state.
+    pub fn cycle_tab(&mut self, forward: bool) {
+        if self.seen_tabs.len() < 2 {
+            return;
+        }
+        let idx = self
+            .seen_tabs
+            .iter()
+            .position(|&t| t == self.active_tab)
+            .unwrap_or(0);
+        let n = self.seen_tabs.len();
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
+        self.tab_selection
+            .insert(self.active_tab, self.selected_row);
+        self.active_tab = self.seen_tabs[next];
+        self.selected_row = *self.tab_selection.get(&self.active_tab).unwrap_or(&0);
+        self.table_offset = 0;
+        self.h_scroll = 0;
+        self.recompute_display();
+    }
+}
+
+/// A class's tab appears the first time it produces rows and stays for the
+/// session, so a transient sampling failure cannot flicker it away.
+fn detect_tabs(seen: &mut Vec<DeviceClass>, rows: &[PortThroughput]) {
+    for class in [DeviceClass::Xgmi, DeviceClass::Nvlink] {
+        if !seen.contains(&class) && rows.iter().any(|t| t.class == class) {
+            seen.push(class);
+            seen.sort_by_key(|c| *c as usize); // Rdma < Xgmi < Nvlink
         }
     }
 }
@@ -902,10 +963,9 @@ fn compute_port_throughput(
         rx_drops_per_sec: rate_by_name(&counter_rates, "rx_drops"),
         counter_rates,
         port_label: None,
-        #[cfg(feature = "nvlink")]
         nvlink: None,
-        #[cfg(feature = "xgmi")]
         xgmi: None,
+        class: DeviceClass::Rdma,
     }
 }
 
@@ -920,12 +980,7 @@ fn compute_throughputs(prev: &[PortStat], curr: &[PortStat], elapsed: f64) -> Ve
 /// NVLink and XGMI rows key by `dev_name` alone because their `port` field
 /// encodes the active-link count, which can change between samples.
 fn throughput_key(t: &PortThroughput) -> String {
-    #[cfg(feature = "nvlink")]
-    if t.nvlink.is_some() {
-        return t.dev_name.clone();
-    }
-    #[cfg(feature = "xgmi")]
-    if t.xgmi.is_some() {
+    if t.nvlink.is_some() || t.xgmi.is_some() {
         return t.dev_name.clone();
     }
     format!("{}/{}", t.dev_name, t.port)
@@ -963,10 +1018,6 @@ fn sort_by_throughput_order(avgs: &mut [PortThroughput], reference: &[PortThroug
 /// exactly once per GPU (from the first active link, or the first link if no
 /// link is active) instead of summing across links. Summing would multiply
 /// the aggregate by the number of active links.
-///
-/// Per-link error `CounterRate`s (crc/replay/recovery) are still emitted for
-/// every link so the detail pane can display per-lane error counts.
-#[cfg(feature = "nvlink")]
 fn compute_nvlink_throughputs(
     prev: &[crate::nvlink::NvLinkSnapshot],
     curr: &[crate::nvlink::NvLinkSnapshot],
@@ -1089,8 +1140,8 @@ fn compute_nvlink_throughputs(
                 active_links: active,
                 links,
             }),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         });
     }
     out
@@ -1099,7 +1150,6 @@ fn compute_nvlink_throughputs(
 /// Compute one `PortThroughput` row per GPU from a pair of XGMI snapshots.
 /// amdsmi reports true per-link accumulators, so GPU totals are the sum of
 /// per-link deltas; meta links carry per-second byte rates for the pane.
-#[cfg(feature = "xgmi")]
 fn compute_xgmi_throughputs(
     prev: &[crate::xgmi::XgmiSnapshot],
     curr: &[crate::xgmi::XgmiSnapshot],
@@ -1182,7 +1232,6 @@ fn compute_xgmi_throughputs(
             rx_drops_per_sec: 0.0,
             counter_rates,
             port_label: Some(format!("{}/{}", active, gpu.link_count)),
-            #[cfg(feature = "nvlink")]
             nvlink: None,
             xgmi: Some(XgmiThroughputMeta {
                 gpu_index: gpu.gpu_index,
@@ -1190,12 +1239,13 @@ fn compute_xgmi_throughputs(
                 active_links: active,
                 links,
             }),
+            class: DeviceClass::Xgmi,
         });
     }
     out
 }
 
-#[cfg(all(test, feature = "xgmi"))]
+#[cfg(test)]
 mod xgmi_tests {
     use super::*;
     use crate::xgmi::{XgmiLinkSnapshot, XgmiSnapshot};
@@ -1348,7 +1398,7 @@ mod xgmi_tests {
     }
 }
 
-#[cfg(all(test, feature = "nvlink"))]
+#[cfg(test)]
 mod nvlink_tests {
     use super::*;
     use crate::nvlink::{LinkSnapshot, NvLinkSnapshot, RemoteDeviceType};
@@ -1893,8 +1943,8 @@ mod nvlink_tests {
                 active_links: 2,
                 links: Vec::new(),
             }),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         };
         let rdma_a_ref = PortThroughput {
             dev_name: "mlx5_0".to_string(),
@@ -1907,10 +1957,9 @@ mod nvlink_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: None,
-            #[cfg(feature = "nvlink")]
             nvlink: None,
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Rdma,
         };
         let rdma_b_ref = PortThroughput {
             dev_name: "mlx5_1".to_string(),
@@ -1923,10 +1972,9 @@ mod nvlink_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: None,
-            #[cfg(feature = "nvlink")]
             nvlink: None,
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Rdma,
         };
         let reference = vec![rdma_a_ref.clone(), nvlink_ref.clone(), rdma_b_ref.clone()];
         let nvlink_ref_pos = 1usize;
@@ -1944,15 +1992,14 @@ mod nvlink_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: Some("3/3".to_string()),
-            #[cfg(feature = "nvlink")]
             nvlink: Some(NvLinkThroughputMeta {
                 gpu_index: 0,
                 gpu_name: "H100".to_string(),
                 active_links: 3,
                 links: Vec::new(),
             }),
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Nvlink,
         };
         let rdma_a_avg = PortThroughput {
             dev_name: "mlx5_0".to_string(),
@@ -1965,10 +2012,9 @@ mod nvlink_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: None,
-            #[cfg(feature = "nvlink")]
             nvlink: None,
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Rdma,
         };
         let rdma_b_avg = PortThroughput {
             dev_name: "mlx5_1".to_string(),
@@ -1981,10 +2027,9 @@ mod nvlink_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: None,
-            #[cfg(feature = "nvlink")]
             nvlink: None,
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Rdma,
         };
         let mut avgs = vec![rdma_b_avg.clone(), nvlink_avg.clone(), rdma_a_avg.clone()];
 
@@ -2023,10 +2068,9 @@ mod sort_tests {
             rx_drops_per_sec: 0.0,
             counter_rates: Vec::new(),
             port_label: None,
-            #[cfg(feature = "nvlink")]
             nvlink: None,
-            #[cfg(feature = "xgmi")]
             xgmi: None,
+            class: DeviceClass::Rdma,
         }
     }
 
@@ -2061,5 +2105,101 @@ mod sort_tests {
                 ("mlx5_10".to_string(), 1),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    fn row(class: DeviceClass, name: &str) -> PortThroughput {
+        PortThroughput {
+            dev_name: name.to_string(),
+            port: 1,
+            link_gbps: None,
+            tx_gbps: 0.0,
+            rx_gbps: 0.0,
+            tx_pkts_per_sec: 0.0,
+            rx_pkts_per_sec: 0.0,
+            rx_drops_per_sec: 0.0,
+            counter_rates: Vec::new(),
+            port_label: None,
+            nvlink: None,
+            xgmi: None,
+            class,
+        }
+    }
+
+    #[test]
+    fn detect_tabs_is_sticky() {
+        let mut seen = vec![DeviceClass::Rdma];
+        detect_tabs(&mut seen, &[row(DeviceClass::Xgmi, "amdgpu0")]);
+        assert_eq!(seen, vec![DeviceClass::Rdma, DeviceClass::Xgmi]);
+        // rows disappear -> tab stays
+        detect_tabs(&mut seen, &[]);
+        assert_eq!(seen, vec![DeviceClass::Rdma, DeviceClass::Xgmi]);
+        // no duplicates
+        detect_tabs(&mut seen, &[row(DeviceClass::Xgmi, "amdgpu0")]);
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn detect_tabs_orders_rdma_xgmi_nvlink() {
+        let mut seen = vec![DeviceClass::Rdma];
+        detect_tabs(&mut seen, &[row(DeviceClass::Nvlink, "nvidia0")]);
+        detect_tabs(&mut seen, &[row(DeviceClass::Xgmi, "amdgpu0")]);
+        assert_eq!(
+            seen,
+            vec![DeviceClass::Rdma, DeviceClass::Xgmi, DeviceClass::Nvlink]
+        );
+    }
+
+    #[test]
+    fn display_filters_by_active_tab() {
+        let mut app = App::new();
+        app.throughputs = vec![
+            row(DeviceClass::Rdma, "mlx5_0"),
+            row(DeviceClass::Rdma, "mlx5_1"),
+            row(DeviceClass::Xgmi, "amdgpu0"),
+        ];
+        app.active_tab = DeviceClass::Rdma;
+        app.recompute_display();
+        assert_eq!(app.display_throughputs().len(), 2);
+        app.active_tab = DeviceClass::Xgmi;
+        app.recompute_display();
+        assert_eq!(app.display_throughputs().len(), 1);
+        assert_eq!(app.display_throughputs()[0].dev_name, "amdgpu0");
+    }
+
+    #[test]
+    fn cycle_wraps_and_remembers_selection() {
+        let mut app = App::new();
+        app.throughputs = vec![
+            row(DeviceClass::Rdma, "mlx5_0"),
+            row(DeviceClass::Rdma, "mlx5_1"),
+            row(DeviceClass::Rdma, "mlx5_2"),
+            row(DeviceClass::Xgmi, "amdgpu0"),
+        ];
+        app.seen_tabs = vec![DeviceClass::Rdma, DeviceClass::Xgmi];
+        app.active_tab = DeviceClass::Rdma;
+        app.recompute_display();
+        app.selected_row = 2;
+        app.cycle_tab(true);
+        assert_eq!(app.active_tab, DeviceClass::Xgmi);
+        assert_eq!(app.selected_row, 0);
+        app.cycle_tab(true); // wraps back
+        assert_eq!(app.active_tab, DeviceClass::Rdma);
+        assert_eq!(app.selected_row, 2, "remembered per-tab cursor");
+        app.cycle_tab(false); // backward wraps to Xgmi
+        assert_eq!(app.active_tab, DeviceClass::Xgmi);
+    }
+
+    #[test]
+    fn single_tab_cycle_is_noop() {
+        let mut app = App::new();
+        app.seen_tabs = vec![DeviceClass::Rdma];
+        app.active_tab = DeviceClass::Rdma;
+        app.cycle_tab(true);
+        assert_eq!(app.active_tab, DeviceClass::Rdma);
     }
 }
