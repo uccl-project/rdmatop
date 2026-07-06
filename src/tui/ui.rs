@@ -32,12 +32,6 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("r", "Record Perfetto trace (start/stop)"),
     ("h", "Toggle this help"),
     ("q", "Quit"),
-    ("", ""),
-    ("", "── Detail mode ──"),
-    ("↑ / k", "Scroll up"),
-    ("↓ / j", "Scroll down"),
-    ("", "Scroll past end → next device"),
-    ("", "Scroll past top  → prev device"),
 ];
 
 const RDMA_LINK_GBPS: f64 = 100.0;
@@ -1168,8 +1162,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
 fn draw_help_popup(frame: &mut Frame, tc: &ThemeColors) {
     let area = frame.area();
-    let w = 50.min(area.width.saturating_sub(4));
-    let h = 18.min(area.height.saturating_sub(4));
+    // Size the popup to the longest row (16-char key column + description)
+    // plus borders, so nothing gets clipped.
+    let mut content_w = 0;
+    for (_, desc) in HELP_KEYS {
+        content_w = content_w.max(16 + desc.chars().count());
+    }
+    let w = (content_w as u16 + 2).min(area.width.saturating_sub(4));
+    let h = (HELP_KEYS.len() as u16 + 2).min(area.height.saturating_sub(4));
     let popup = centered_rect(area, w, h);
 
     frame.render_widget(Clear, popup);
@@ -1259,14 +1259,10 @@ fn draw_column_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn help_line(key: &str, desc: &str, tc: &ThemeColors) -> Line<'static> {
-    if key.is_empty() {
-        Line::from(styled(&format!("  {}", desc), tc.group_title, false))
-    } else {
-        Line::from(vec![
-            styled(&format!("  {:<14}", key), tc.accent, false),
-            styled(desc, tc.fg, false),
-        ])
-    }
+    Line::from(vec![
+        styled(&format!("  {:<14}", key), tc.accent, false),
+        styled(desc, tc.fg, false),
+    ])
 }
 
 fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {

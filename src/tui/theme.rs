@@ -54,7 +54,6 @@ pub struct ThemeColors {
     pub status_bg: Color,
     pub status_fg: Color,
     pub header_fg: Color,
-    pub group_title: Color,
 }
 
 fn default_colors() -> ThemeColors {
@@ -71,7 +70,6 @@ fn default_colors() -> ThemeColors {
         status_bg: Color::Green,
         status_fg: Color::Black,
         header_fg: Color::Cyan,
-        group_title: Color::Yellow,
     }
 }
 
@@ -89,7 +87,6 @@ fn dracula_colors() -> ThemeColors {
         status_bg: Color::Rgb(170, 140, 220),
         status_fg: Color::Rgb(30, 30, 40),
         header_fg: Color::Rgb(150, 210, 240),
-        group_title: Color::Rgb(220, 220, 160),
     }
 }
 
@@ -107,7 +104,6 @@ fn nord_colors() -> ThemeColors {
         status_bg: Color::Rgb(130, 165, 195),
         status_fg: Color::Rgb(40, 45, 55),
         header_fg: Color::Rgb(140, 190, 210),
-        group_title: Color::Rgb(220, 200, 150),
     }
 }
 
@@ -125,7 +121,6 @@ fn monokai_colors() -> ThemeColors {
         status_bg: Color::Rgb(220, 160, 70),
         status_fg: Color::Rgb(35, 35, 30),
         header_fg: Color::Rgb(130, 200, 220),
-        group_title: Color::Rgb(210, 200, 130),
     }
 }
 
@@ -143,6 +138,5 @@ fn gruvbox_colors() -> ThemeColors {
         status_bg: Color::Rgb(200, 115, 50),
         status_fg: Color::Rgb(35, 35, 35),
         header_fg: Color::Rgb(145, 175, 165),
-        group_title: Color::Rgb(230, 185, 75),
     }
 }
