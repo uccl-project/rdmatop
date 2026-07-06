@@ -8,10 +8,6 @@ repository = "https://github.com/uccl-project/rdmatop"
 keywords = ["rdma", "efa", "networking", "tui", "infiniband"]
 categories = ["network-programming", "command-line-utilities"]
 
-[features]
-nvlink = ["dep:nvml-wrapper", "dep:nvml-wrapper-sys"]
-xgmi = ["dep:libloading"]
-
 [profile.release]
 strip = true
 
@@ -27,6 +23,6 @@ alphanumeric-sort = "1.5"
 libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
-nvml-wrapper = { version = "0.12.1", optional = true }
-nvml-wrapper-sys = { version = "0.9.1", optional = true }
-libloading = { version = "0.8", optional = true }
+nvml-wrapper = "0.12.1"
+nvml-wrapper-sys = "0.9.1"
+libloading = "0.8"

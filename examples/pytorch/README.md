@@ -25,10 +25,10 @@ detail pane shows traffic on every link.
   # NVIDIA (CUDA)
   pip install torch
   ```
-- `rdmatop` built with the matching feature to see the GPU rows:
+- `rdmatop` to see the GPU rows (XGMI/NVLink hardware is detected at
+  runtime — no build flags needed):
   ```bash
-  cargo install --path . --features xgmi     # AMD
-  cargo install --path . --features nvlink   # NVIDIA
+  cargo install --path .
   ```
 
 ## Usage

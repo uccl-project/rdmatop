@@ -1,6 +1,6 @@
-//! XGMI data layer built on top of AMD SMI (`libamd_smi`), compiled only
-//! with the `xgmi` cargo feature. The library is dlopen'd at runtime; when
-//! absent or failing to init, `read_all_xgmi_stats` returns an empty vector.
+//! XGMI data layer built on top of AMD SMI (`libamd_smi`). The library is
+//! dlopen'd at runtime; when absent or failing to init,
+//! `read_all_xgmi_stats` returns an empty vector.
 
 use std::ffi::CStr;
 use std::io;
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(format_bdf((0x65 << 8) | (0x1f << 3) | 0x7), "0000:65:1f.7");
     }
 
-    /// Hardware smoke test: run with `cargo test --features xgmi -- --ignored`
+    /// Hardware smoke test: run with `cargo test -- --ignored`
     /// on a machine with AMD GPUs.
     #[test]
     #[ignore]

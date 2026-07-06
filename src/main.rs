@@ -1,14 +1,10 @@
 mod net;
 mod netlink;
+mod nvlink;
 mod rdma;
 mod stat;
 mod trace;
 mod tui;
-
-#[cfg(feature = "nvlink")]
-mod nvlink;
-
-#[cfg(feature = "xgmi")]
 mod xgmi;
 
 use std::io;
