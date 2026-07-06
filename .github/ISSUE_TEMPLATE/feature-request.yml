@@ -1,0 +1,29 @@
+name: 🚀 Feature request
+description: Suggest an idea for rdmatop
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: Motivation
+      description: What problem would this solve? What are you monitoring?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed change
+      description: >
+        What you'd like to see (UI mockups, counter sources, example
+        commands welcome).
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives
+      description: Workarounds or other tools you've considered.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true

@@ -1,0 +1,37 @@
+name: 🐛 Bug report
+description: Report a problem with rdmatop
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: Environment
+      description: >
+        rdmatop version and install method (cargo / PPA / source), OS and
+        kernel, driver stack (rdma-core, ROCm, NVIDIA driver), and hardware
+        (NIC / GPU models).
+      placeholder: |
+        rdmatop 0.1.22 (cargo install)
+        Ubuntu 24.04, kernel 6.8
+        rdma-core 50, ROCm 6.4.2
+        8x Broadcom Thor2 (bnxt_re), 8x MI325X
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened
+      description: >
+        What you expected vs what you saw. Paste TUI output or attach a
+        screenshot; include `RUST_BACKTRACE=1` output for panics.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: How to reproduce
+      description: Steps or commands, including any traffic generator used.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
