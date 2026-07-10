@@ -2,9 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Cell, Clear, Paragraph, Row, ScrollbarState, Table, TableState,
-    },
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, ScrollbarState, Table, TableState},
     Frame,
 };
 
@@ -427,7 +425,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
         .block(
             Block::default()
                 .borders(Borders::ALL)
-        .border_set(super::glyphs::border())
+                .border_set(super::glyphs::border())
                 .border_style(Style::default().fg(tc.border))
                 .title(title)
                 .title_style(Style::default().fg(tc.accent)),
@@ -562,7 +560,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-        .border_set(super::glyphs::border())
+                .border_set(super::glyphs::border())
                 .border_style(Style::default().fg(tc.border))
                 .title(title)
                 .title_style(Style::default().fg(tc.accent)),
@@ -626,19 +624,23 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 }
 
 fn sparkline_str(data: &[f64], width: usize) -> String {
-    const BARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // Height ramps by index 0..8; ASCII keeps the graph shape without a
+    // mushy underline (idle reads as '.', not '_') in non-UTF-8 locales.
+    const U: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const A: &[char] = &[' ', '.', '.', ':', ':', '=', '=', '#', '#'];
+    let bars = if super::glyphs::unicode() { U } else { A };
     let max = data.iter().cloned().fold(0.0f64, f64::max).max(0.01);
     let start = data.len().saturating_sub(width);
     let mut s = String::with_capacity(width);
     for &v in &data[start..] {
         let idx = ((v / max) * 8.0).round() as usize;
-        s.push(BARS[idx.min(8)]);
+        s.push(bars[idx.min(8)]);
     }
     // Pad if not enough data
     while s.chars().count() < width {
         s.insert(0, ' ');
     }
-    super::glyphs::tr(&s).into_owned()
+    s
 }
 
 fn build_detail_lines(
@@ -1030,7 +1032,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
             frame.render_widget(
                 Block::default()
                     .borders(Borders::ALL)
-        .border_set(super::glyphs::border())
+                    .border_set(super::glyphs::border())
                     .border_style(Style::default().fg(tc.border))
                     .title(" Detail "),
                 area,

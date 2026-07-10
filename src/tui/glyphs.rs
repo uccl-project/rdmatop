@@ -1,36 +1,79 @@
-//! ASCII fallback for terminals whose locale isn't UTF-8 (e.g. LC_ALL=C, or
-//! tmux without `-u`), where box-drawing/block glyphs render as garbage.
-//! We build the UI in Unicode as usual and transliterate at the emit points.
+//! ASCII fallback for terminals that can't render UTF-8, where box-drawing and
+//! block glyphs come out as garbage. We probe the terminal at startup (see
+//! [`detect`]) and build the UI in Unicode or ASCII accordingly.
 
 use ratatui::symbols;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
 use std::borrow::Cow;
+use std::io::Write;
 use std::sync::OnceLock;
 
-/// Whether we can safely draw UTF-8 glyphs. Cached at first call.
-///
-/// Locale-driven, like htop: a UTF-8 `LC_*`/`LANG` gets blocks, anything else
-/// (C/POSIX) gets ASCII. `RDMATOP_UNICODE=0|1` forces it either way. Note that
-/// `tmux -u` alone does NOT change the locale, so to get blocks under tmux set
-/// a UTF-8 locale (e.g. `LC_ALL=C.UTF-8`) — which also renders without `-u`.
+static UNICODE: OnceLock<bool> = OnceLock::new();
+
+/// Whether we can safely draw UTF-8 glyphs. Cached after [`detect`].
 pub fn unicode() -> bool {
-    static U: OnceLock<bool> = OnceLock::new();
-    *U.get_or_init(|| {
-        if let Ok(v) = std::env::var("RDMATOP_UNICODE") {
-            let v = v.to_ascii_lowercase();
-            return !matches!(v.as_str(), "" | "0" | "false" | "no");
-        }
-        // POSIX precedence: LC_ALL > LC_CTYPE > LANG; first non-empty decides.
-        for k in ["LC_ALL", "LC_CTYPE", "LANG"] {
-            if let Ok(v) = std::env::var(k) {
-                if !v.is_empty() {
-                    let v = v.to_ascii_uppercase();
-                    return v.contains("UTF-8") || v.contains("UTF8");
-                }
+    *UNICODE.get_or_init(locale_utf8)
+}
+
+/// Decide UTF-8 support from the live terminal, once, at startup. Must run in
+/// raw mode with the alternate screen active. Inside tmux we trust its client
+/// flag; otherwise we probe the terminal, then fall back to the locale.
+pub fn detect() {
+    let ok = tmux_utf8() // authoritative inside tmux
+        .or_else(probe) // else ask the real terminal
+        .unwrap_or_else(locale_utf8);
+    let _ = UNICODE.set(ok);
+}
+
+/// Whether tmux will actually render UTF-8. The cursor probe is fooled under
+/// tmux: its grid always decodes UTF-8, so the cursor advances as if UTF-8 even
+/// when the client (non-UTF-8 locale, no `-u`) will strip the bytes to garbage.
+/// `#{client_utf8}` is the only signal that reflects what reaches the terminal.
+/// `None` when not under tmux, or no client is attached to answer.
+fn tmux_utf8() -> Option<bool> {
+    std::env::var_os("TMUX")?;
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{client_utf8}"])
+        .output()
+        .ok()?;
+    match out.stdout.first().copied()? {
+        b'1' => Some(true),
+        b'0' => Some(false),
+        _ => None,
+    }
+}
+
+/// Print a 1-column multibyte glyph and see how far the cursor moved: 1 column
+/// means the terminal decoded UTF-8, more means it counted raw bytes.
+fn probe() -> Option<bool> {
+    use crossterm::{cursor, queue, terminal};
+    let mut out = std::io::stdout();
+    queue!(out, cursor::MoveTo(0, 0)).ok()?;
+    write!(out, "\u{2588}").ok()?; // █: 3 UTF-8 bytes, 1 display column
+    out.flush().ok()?;
+    let (col, _) = cursor::position().ok()?;
+    queue!(
+        out,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(terminal::ClearType::All)
+    )
+    .ok()?;
+    out.flush().ok()?;
+    Some(col == 1)
+}
+
+/// Locale fallback, like htop: a UTF-8 `LC_*`/`LANG` gets blocks, else ASCII.
+fn locale_utf8() -> bool {
+    // POSIX precedence: LC_ALL > LC_CTYPE > LANG; first non-empty decides.
+    for k in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                let v = v.to_ascii_uppercase();
+                return v.contains("UTF-8") || v.contains("UTF8");
             }
         }
-        false
-    })
+    }
+    false
 }
 
 /// Map a Unicode glyph to its closest ASCII stand-in.
@@ -142,9 +185,10 @@ mod tests {
     fn ascii_map_covers_ui_glyphs() {
         // Every glyph the UI emits must have an ASCII stand-in, and none map
         // back to a multibyte char.
-        for c in ['│', '─', '↑', '↓', '←', '→', '●', '▏', '▐', '▲', '▼', '◀',
-            '▶', '▬', '±', '…', '█', '▇', '▆', '▅', '▄', '▃', '▂', '▁', '░']
-        {
+        for c in [
+            '│', '─', '↑', '↓', '←', '→', '●', '▏', '▐', '▲', '▼', '◀', '▶', '▬', '±', '…', '█',
+            '▇', '▆', '▅', '▄', '▃', '▂', '▁', '░',
+        ] {
             let a = ascii(c).unwrap_or_else(|| panic!("no ascii for {c:?}"));
             assert!(a.is_ascii(), "{c:?} -> {a:?} is not ascii");
         }
