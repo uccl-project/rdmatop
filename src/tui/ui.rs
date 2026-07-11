@@ -2,10 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, TableState,
-    },
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, ScrollbarState, Table, TableState},
     Frame,
 };
 
@@ -222,6 +219,7 @@ fn header_line3(app: &App, tc: &ThemeColors) -> Line<'static> {
 fn draw_header(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
         .border_style(Style::default().fg(tc.border));
     let lines = vec![
         header_line1(app, tc),
@@ -263,7 +261,11 @@ fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
     let max = link_gbps.filter(|&r| r > 0.0).unwrap_or(RDMA_LINK_GBPS);
     let ratio = (gbps / max).clamp(0.0, 1.0);
     let filled = (ratio * BAR_WIDTH as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(BAR_WIDTH - filled))
+    let (fill, empty) = super::glyphs::meter();
+    let mut bar = String::with_capacity(BAR_WIDTH * fill.len_utf8());
+    bar.extend(std::iter::repeat_n(fill, filled));
+    bar.extend(std::iter::repeat_n(empty, BAR_WIDTH - filled));
+    bar
 }
 
 fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
@@ -423,6 +425,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_set(super::glyphs::border())
                 .border_style(Style::default().fg(tc.border))
                 .title(title)
                 .title_style(Style::default().fg(tc.accent)),
@@ -432,7 +435,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
                 .bg(tc.highlight_bg)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(super::glyphs::cursor());
 
     let mut state = TableState::default();
     if !display.is_empty() {
@@ -452,11 +455,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
     if display.len() > area.height.saturating_sub(4) as usize {
         let mut v_scroll = ScrollbarState::new(display.len()).position(app.selected_row);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .thumb_symbol("▐")
-                .track_symbol(Some("│"))
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"))
+            super::glyphs::v_scrollbar()
                 .thumb_style(Style::default().fg(tc.accent))
                 .track_style(Style::default().fg(tc.border)),
             area.inner(Margin {
@@ -561,6 +560,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_set(super::glyphs::border())
                 .border_style(Style::default().fg(tc.border))
                 .title(title)
                 .title_style(Style::default().fg(tc.accent)),
@@ -570,7 +570,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 .bg(tc.highlight_bg)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(super::glyphs::cursor());
 
     let mut state = TableState::default();
     if !display.is_empty() {
@@ -595,11 +595,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     if display.len() > area.height.saturating_sub(4) as usize {
         let mut v_scroll = ScrollbarState::new(display.len()).position(app.selected_row);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .thumb_symbol("▐")
-                .track_symbol(Some("│"))
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"))
+            super::glyphs::v_scrollbar()
                 .thumb_style(Style::default().fg(tc.accent))
                 .track_style(Style::default().fg(tc.border)),
             area.inner(Margin {
@@ -615,11 +611,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     if all_cols.len() > cols_to_render.len() || app.h_scroll > 0 {
         let mut h_scroll = ScrollbarState::new(all_cols.len()).position(app.h_scroll);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                .thumb_symbol("▬")
-                .track_symbol(Some("─"))
-                .begin_symbol(Some("◀"))
-                .end_symbol(Some("▶"))
+            super::glyphs::h_scrollbar()
                 .thumb_style(Style::default().fg(tc.accent))
                 .track_style(Style::default().fg(tc.border)),
             area.inner(Margin {
@@ -632,13 +624,17 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 }
 
 fn sparkline_str(data: &[f64], width: usize) -> String {
-    const BARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // Height ramps by index 0..8; ASCII keeps the graph shape without a
+    // mushy underline (idle reads as '.', not '_') in non-UTF-8 locales.
+    const U: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const A: &[char] = &[' ', '.', '.', ':', ':', '=', '=', '#', '#'];
+    let bars = if super::glyphs::unicode() { U } else { A };
     let max = data.iter().cloned().fold(0.0f64, f64::max).max(0.01);
     let start = data.len().saturating_sub(width);
     let mut s = String::with_capacity(width);
     for &v in &data[start..] {
         let idx = ((v / max) * 8.0).round() as usize;
-        s.push(BARS[idx.min(8)]);
+        s.push(bars[idx.min(8)]);
     }
     // Pad if not enough data
     while s.chars().count() < width {
@@ -1036,6 +1032,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
             frame.render_widget(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_set(super::glyphs::border())
                     .border_style(Style::default().fg(tc.border))
                     .title(" Detail "),
                 area,
@@ -1067,6 +1064,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
         .border_style(Style::default().fg(tc.border))
         .title(title)
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
@@ -1122,10 +1120,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     } else {
         "  a:avg  w:set".to_string()
     };
-    let keys = format!(
+    let keys = super::glyphs::tr(&format!(
         " ↑↓/jk:nav  {}  t:theme  <>:refresh  r:rec  h:help  q:quit{}",
         hint, avg_hint
-    );
+    ))
+    .into_owned();
     let mode_style = Style::default()
         .fg(tc.status_fg)
         .bg(tc.status_bg)
@@ -1135,7 +1134,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let mut spans = vec![mode];
     if let Some((secs, samples)) = app.recording_progress() {
         spans.push(Span::styled(
-            format!(" ● REC {}:{:02} ({}) ", secs / 60, secs % 60, samples),
+            super::glyphs::tr(&format!(
+                " ● REC {}:{:02} ({}) ",
+                secs / 60,
+                secs % 60,
+                samples
+            ))
+            .into_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     } else if let Some(msg) = &app.record_status {
@@ -1169,6 +1174,7 @@ fn draw_help_popup(frame: &mut Frame, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
         .border_style(Style::default().fg(tc.accent))
         .title(" Help (h/Esc to close) ")
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
@@ -1195,6 +1201,7 @@ fn draw_window_input_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
         .border_style(Style::default().fg(tc.accent))
         .title(" Set Avg Window ")
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
@@ -1239,6 +1246,7 @@ fn draw_column_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
         .border_style(Style::default().fg(tc.accent))
         .title(" Columns (Space:toggle  Esc:close) ")
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
@@ -1265,7 +1273,7 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 fn styled(text: &str, color: ratatui::style::Color, bold: bool) -> Span<'static> {
     let s = Style::default().fg(color);
     Span::styled(
-        text.to_string(),
+        super::glyphs::tr(text).into_owned(),
         if bold {
             s.add_modifier(Modifier::BOLD)
         } else {
@@ -1339,11 +1347,15 @@ fn fmt_mem_kb(kb: u64) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max - 1])
+    // Count chars, not bytes: byte slicing panics mid-codepoint, and the
+    // ellipsis is 3 chars ("...") in ASCII mode, so budget for its width.
+    if s.chars().count() <= max {
+        return s.to_string();
     }
+    let dots = super::glyphs::tr("…");
+    let keep = max.saturating_sub(dots.chars().count());
+    let cut: String = s.chars().take(keep).collect();
+    format!("{cut}{dots}")
 }
 
 #[cfg(test)]
@@ -1366,7 +1378,8 @@ mod tab_bar_tests {
         let text = line_text(&bar);
         assert!(text.contains("RDMA"), "bar: {text:?}");
         assert!(text.contains("XGMI"), "bar: {text:?}");
-        assert!(text.contains('│'), "bar: {text:?}");
+        // Separator is '│' under UTF-8, '|' under a C locale (ASCII fallback).
+        assert!(text.contains('│') || text.contains('|'), "bar: {text:?}");
     }
 
     #[test]
