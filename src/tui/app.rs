@@ -60,6 +60,9 @@ pub struct XgmiThroughputMeta {
     pub gpu_name: String,
     pub active_links: u32,
     pub links: Vec<crate::xgmi::XgmiLinkSnapshot>,
+    /// Live GPU health (util/vram/temp/power/clock) for the gauge strip
+    /// and detail pane.
+    pub metrics: Option<crate::gpu::GpuMetrics>,
 }
 
 /// Per-GPU NVLink metadata. The TUI uses this to show per-link details
@@ -75,6 +78,9 @@ pub struct NvLinkThroughputMeta {
     pub gpu_name: String,
     pub active_links: u32,
     pub links: Vec<crate::nvlink::LinkSnapshot>,
+    /// Live GPU health (util/vram/temp/power/clock) for the gauge strip
+    /// and detail pane.
+    pub metrics: Option<crate::gpu::GpuMetrics>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +407,7 @@ const HISTORY_LEN: usize = 60;
 pub struct DeviceHistory {
     pub tx: Vec<f64>,
     pub rx: Vec<f64>,
+    pub util: Vec<f64>,
 }
 
 impl DeviceHistory {
@@ -408,6 +415,7 @@ impl DeviceHistory {
         Self {
             tx: Vec::with_capacity(HISTORY_LEN),
             rx: Vec::with_capacity(HISTORY_LEN),
+            util: Vec::with_capacity(HISTORY_LEN),
         }
     }
 
@@ -418,6 +426,13 @@ impl DeviceHistory {
         }
         self.tx.push(tx);
         self.rx.push(rx);
+    }
+
+    fn push_util(&mut self, util: f64) {
+        if self.util.len() >= HISTORY_LEN {
+            self.util.remove(0);
+        }
+        self.util.push(util);
     }
 }
 
@@ -597,10 +612,20 @@ impl App {
 
     fn update_history(&mut self) {
         for t in &self.throughputs {
-            self.history
+            let util = t
+                .nvlink
+                .as_ref()
+                .and_then(|m| m.metrics.as_ref())
+                .or_else(|| t.xgmi.as_ref().and_then(|m| m.metrics.as_ref()))
+                .and_then(|m| m.util_pct);
+            let entry = self
+                .history
                 .entry(t.dev_name.clone())
-                .or_insert_with(DeviceHistory::new)
-                .push(t.tx_gbps, t.rx_gbps);
+                .or_insert_with(DeviceHistory::new);
+            entry.push(t.tx_gbps, t.rx_gbps);
+            if let Some(u) = util {
+                entry.push_util(u as f64);
+            }
         }
     }
 
@@ -1207,6 +1232,7 @@ fn compute_nvlink_throughputs(
                 gpu_name: gpu.gpu_name.clone(),
                 active_links: active,
                 links,
+                metrics: gpu.metrics.clone(),
             }),
             xgmi: None,
             class: DeviceClass::Nvlink,
@@ -1306,6 +1332,7 @@ fn compute_xgmi_throughputs(
                 gpu_name: gpu.gpu_name.clone(),
                 active_links: active,
                 links,
+                metrics: gpu.metrics.clone(),
             }),
             class: DeviceClass::Xgmi,
         });
@@ -1339,6 +1366,7 @@ mod xgmi_tests {
             link_gbps: Some(512.0 * active as f64),
             correctable_errors: Some(0),
             uncorrectable_errors: Some(0),
+            metrics: None,
             links,
         }
     }
@@ -1494,6 +1522,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1506,6 +1535,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1581,6 +1611,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1593,6 +1624,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1649,6 +1681,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1661,6 +1694,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1692,6 +1726,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 1,
             gpu_name: "A100".to_string(),
+            metrics: None,
             link_count: 1,
             link_gbps: Some(50.0),
             tx_bytes: None,
@@ -1719,6 +1754,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1728,6 +1764,7 @@ mod nvlink_tests {
         let curr_first = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1752,6 +1789,7 @@ mod nvlink_tests {
         let curr_second = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1791,6 +1829,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 1,
             link_gbps: Some(50.0),
             tx_bytes: None,
@@ -1800,6 +1839,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 1,
             link_gbps: Some(50.0),
             tx_bytes: None,
@@ -1838,6 +1878,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 2,
             gpu_name: "B200".to_string(),
+            metrics: None,
             link_count: 1,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1852,6 +1893,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 2,
             gpu_name: "B200".to_string(),
+            metrics: None,
             link_count: 1,
             link_gbps: Some(100.0),
             tx_bytes: None,
@@ -1878,6 +1920,7 @@ mod nvlink_tests {
         let prev_a = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1887,6 +1930,7 @@ mod nvlink_tests {
         let curr_a = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1906,6 +1950,7 @@ mod nvlink_tests {
         let curr_b = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 3,
             link_gbps: Some(150.0),
             tx_bytes: None,
@@ -1946,6 +1991,7 @@ mod nvlink_tests {
         let prev = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: Some(10_000_000_000),
@@ -1958,6 +2004,7 @@ mod nvlink_tests {
         let curr = vec![NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
+            metrics: None,
             link_count: 2,
             link_gbps: Some(100.0),
             tx_bytes: Some(15_000_000_000),
@@ -2010,6 +2057,7 @@ mod nvlink_tests {
                 gpu_name: "H100".to_string(),
                 active_links: 2,
                 links: Vec::new(),
+                metrics: None,
             }),
             xgmi: None,
             class: DeviceClass::Nvlink,
@@ -2065,6 +2113,7 @@ mod nvlink_tests {
                 gpu_name: "H100".to_string(),
                 active_links: 3,
                 links: Vec::new(),
+                metrics: None,
             }),
             xgmi: None,
             class: DeviceClass::Nvlink,
@@ -2309,6 +2358,10 @@ mod apply_snapshot_tests {
         let gpu = crate::nvlink::NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "test-gpu".to_string(),
+            metrics: Some(crate::gpu::GpuMetrics {
+                util_pct: Some(42),
+                ..Default::default()
+            }),
             link_count: 0,
             link_gbps: None,
             tx_bytes: Some(tx_bytes),
@@ -2323,6 +2376,17 @@ mod apply_snapshot_tests {
             processes: Some(Vec::new()),
             taken_at,
         }
+    }
+
+    #[test]
+    fn gpu_util_flows_into_history() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(gpu_snapshot(0, t0));
+        app.apply_snapshot(gpu_snapshot(1_000, t0 + Duration::from_secs(2)));
+        let h = app.history.get("nvidia0").expect("history for nvidia0");
+        assert_eq!(h.util.len(), 2);
+        assert_eq!(h.util[0], 42.0);
     }
 
     #[test]

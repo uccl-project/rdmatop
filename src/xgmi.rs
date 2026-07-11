@@ -39,6 +39,8 @@ pub struct XgmiSnapshot {
     /// XGMI_WAFL block accumulated ECC counts (per-GPU, not per-link).
     pub correctable_errors: Option<u64>,
     pub uncorrectable_errors: Option<u64>,
+    /// Live GPU health (util/vram/temp/power/clock) for the gauge strip.
+    pub metrics: Option<crate::gpu::GpuMetrics>,
     pub links: Vec<XgmiLinkSnapshot>,
 }
 
@@ -75,6 +77,9 @@ mod ffi {
     pub const AMDSMI_MAX_NUM_XGMI_PHYSICAL_LINK: usize = 64;
     pub const AMDSMI_IOLINK_TYPE_XGMI: u32 = 2;
     pub const AMDSMI_GPU_BLOCK_XGMI_WAFL: u64 = 0x80;
+    pub const AMDSMI_TEMPERATURE_TYPE_EDGE: u32 = 0;
+    pub const AMDSMI_TEMP_CURRENT: u32 = 0;
+    pub const AMDSMI_CLK_TYPE_GFX: u32 = 0;
 
     /// One entry of `amdsmi_link_metrics_t.links[]`.
     #[repr(C)]
@@ -128,6 +133,48 @@ mod ffi {
         pub _rest: [u64; 63],
     }
 
+    /// GPU engine utilization percentages (`amdsmi_engine_usage_t`).
+    #[repr(C)]
+    pub struct EngineUsage {
+        pub gfx_activity: u32, // %
+        pub umc_activity: u32, // %
+        pub mm_activity: u32,  // %
+        pub reserved: [u32; 13],
+    }
+
+    /// VRAM usage (`amdsmi_vram_usage_t`); both values in MB, total first.
+    #[repr(C)]
+    pub struct VramUsage {
+        pub vram_total: u32, // MB
+        pub vram_used: u32,  // MB
+        pub reserved: [u32; 2],
+    }
+
+    /// Socket power (`amdsmi_power_info_t`): `current_socket_power` is W on
+    /// MI300+ only; `average_socket_power` is W on Navi/MI200 and earlier.
+    #[repr(C)]
+    pub struct PowerInfo {
+        pub socket_power: u64, // uW, host (virtualization) only
+        pub current_socket_power: u32,
+        pub average_socket_power: u32,
+        pub gfx_voltage: u32, // mV
+        pub soc_voltage: u32, // mV
+        pub mem_voltage: u32, // mV
+        pub power_limit: u32, // W
+        pub reserved: [u32; 2],
+    }
+
+    /// Clock info (`amdsmi_clk_info_t`); only the current `clk` MHz is read.
+    #[repr(C)]
+    pub struct ClkInfo {
+        pub clk: u32,     // MHz
+        pub min_clk: u32, // MHz
+        pub max_clk: u32, // MHz
+        pub clk_locked: u8,
+        pub clk_deep_sleep: u8,
+        pub reserved: [u32; 4],
+    }
+
     // ABI guards: sizes/offsets computed from amdsmi.h (ROCm 6.4.2). A silent
     // layout drift would corrupt every field after the divergence point.
     const _: () = assert!(std::mem::size_of::<LinkMetricsEntry>() == 56);
@@ -140,6 +187,16 @@ mod ffi {
     const _: () = assert!(std::mem::size_of::<PcieInfo>() == 512);
     const _: () = assert!(std::mem::offset_of!(PcieInfo, max_pcie_speed) == 4);
     const _: () = assert!(std::mem::offset_of!(PcieInfo, _rest) == 8);
+    const _: () = assert!(std::mem::size_of::<EngineUsage>() == 64);
+    const _: () = assert!(std::mem::offset_of!(EngineUsage, gfx_activity) == 0);
+    const _: () = assert!(std::mem::size_of::<VramUsage>() == 16);
+    const _: () = assert!(std::mem::offset_of!(VramUsage, vram_total) == 0);
+    const _: () = assert!(std::mem::offset_of!(VramUsage, vram_used) == 4);
+    const _: () = assert!(std::mem::size_of::<PowerInfo>() == 40);
+    const _: () = assert!(std::mem::offset_of!(PowerInfo, current_socket_power) == 8);
+    const _: () = assert!(std::mem::offset_of!(PowerInfo, average_socket_power) == 12);
+    const _: () = assert!(std::mem::size_of::<ClkInfo>() == 32);
+    const _: () = assert!(std::mem::offset_of!(ClkInfo, clk) == 0);
 }
 
 /// Resolved amdsmi function pointers. `_lib` keeps the dlopen handle alive
@@ -167,6 +224,22 @@ struct Amdsmi {
     ) -> ffi::AmdsmiStatus,
     get_gpu_ecc_count:
         unsafe extern "C" fn(ffi::ProcessorHandle, u64, *mut ffi::ErrorCount) -> ffi::AmdsmiStatus,
+    // Health-metric entry points, absent on older libamd_smi builds: each
+    // None disables only its GpuMetrics field; link monitoring still works.
+    get_gpu_activity: Option<
+        unsafe extern "C" fn(ffi::ProcessorHandle, *mut ffi::EngineUsage) -> ffi::AmdsmiStatus,
+    >,
+    get_gpu_vram_usage: Option<
+        unsafe extern "C" fn(ffi::ProcessorHandle, *mut ffi::VramUsage) -> ffi::AmdsmiStatus,
+    >,
+    get_temp_metric:
+        Option<unsafe extern "C" fn(ffi::ProcessorHandle, u32, u32, *mut i64) -> ffi::AmdsmiStatus>,
+    get_power_info: Option<
+        unsafe extern "C" fn(ffi::ProcessorHandle, *mut ffi::PowerInfo) -> ffi::AmdsmiStatus,
+    >,
+    get_clock_info: Option<
+        unsafe extern "C" fn(ffi::ProcessorHandle, u32, *mut ffi::ClkInfo) -> ffi::AmdsmiStatus,
+    >,
 }
 
 /// Library names tried in order: bare sonames first (ld.so search path),
@@ -204,6 +277,11 @@ impl Amdsmi {
                 get_pcie_info: *lib.get(b"amdsmi_get_pcie_info\0").ok()?,
                 topo_get_link_type: *lib.get(b"amdsmi_topo_get_link_type\0").ok()?,
                 get_gpu_ecc_count: *lib.get(b"amdsmi_get_gpu_ecc_count\0").ok()?,
+                get_gpu_activity: lib.get(b"amdsmi_get_gpu_activity\0").ok().map(|s| *s),
+                get_gpu_vram_usage: lib.get(b"amdsmi_get_gpu_vram_usage\0").ok().map(|s| *s),
+                get_temp_metric: lib.get(b"amdsmi_get_temp_metric\0").ok().map(|s| *s),
+                get_power_info: lib.get(b"amdsmi_get_power_info\0").ok().map(|s| *s),
+                get_clock_info: lib.get(b"amdsmi_get_clock_info\0").ok().map(|s| *s),
                 _lib: lib,
             };
             if init(ffi::AMDSMI_INIT_AMD_GPUS) != ffi::AMDSMI_STATUS_SUCCESS {
@@ -449,8 +527,64 @@ fn read_processor_snapshot(
         link_gbps: (total_gbps > 0.0).then_some(total_gbps),
         correctable_errors,
         uncorrectable_errors,
+        metrics: Some(read_gpu_metrics(api, handle)),
         links,
     })
+}
+
+/// Live GPU health; each field None when its call is missing or fails.
+fn read_gpu_metrics(api: &Amdsmi, handle: ffi::ProcessorHandle) -> crate::gpu::GpuMetrics {
+    let util_pct = api.get_gpu_activity.and_then(|f| {
+        let mut u: Padded<ffi::EngineUsage> = Padded::zeroed();
+        (unsafe { f(handle, &mut u.value) } == ffi::AMDSMI_STATUS_SUCCESS)
+            .then_some(u.value.gfx_activity)
+    });
+    let vram = api.get_gpu_vram_usage.and_then(|f| {
+        let mut v: Padded<ffi::VramUsage> = Padded::zeroed();
+        (unsafe { f(handle, &mut v.value) } == ffi::AMDSMI_STATUS_SUCCESS)
+            .then_some((v.value.vram_used as u64, v.value.vram_total as u64))
+    });
+    let temp_c = api.get_temp_metric.and_then(|f| {
+        let mut t: i64 = 0;
+        (unsafe {
+            f(
+                handle,
+                ffi::AMDSMI_TEMPERATURE_TYPE_EDGE,
+                ffi::AMDSMI_TEMP_CURRENT,
+                &mut t,
+            )
+        } == ffi::AMDSMI_STATUS_SUCCESS)
+            // amdsmi returns whole degrees C (the lib divides its millidegree
+            // source by 1000; header doc is misleading).
+            .then_some(t)
+    });
+    let power_w = api.get_power_info.and_then(|f| {
+        let mut p: Padded<ffi::PowerInfo> = Padded::zeroed();
+        if unsafe { f(handle, &mut p.value) } != ffi::AMDSMI_STATUS_SUCCESS {
+            return None;
+        }
+        // current_socket_power is MI300+-only; average_socket_power covers older parts;
+        // 0/0 = unsupported.
+        let w = if p.value.current_socket_power > 0 {
+            p.value.current_socket_power
+        } else {
+            p.value.average_socket_power
+        };
+        (w > 0).then_some(w as f64)
+    });
+    let clock_mhz = api.get_clock_info.and_then(|f| {
+        let mut c: Padded<ffi::ClkInfo> = Padded::zeroed();
+        (unsafe { f(handle, ffi::AMDSMI_CLK_TYPE_GFX, &mut c.value) } == ffi::AMDSMI_STATUS_SUCCESS)
+            .then_some(c.value.clk)
+    });
+    crate::gpu::GpuMetrics {
+        util_pct,
+        vram_used_mb: vram.map(|(u, _)| u),
+        vram_total_mb: vram.map(|(_, t)| t),
+        temp_c,
+        power_w,
+        clock_mhz,
+    }
 }
 
 /// Whether topology reports an XGMI io-link between the two GPUs.
@@ -541,6 +675,7 @@ mod tests {
             link_gbps: None,
             correctable_errors: None,
             uncorrectable_errors: None,
+            metrics: None,
             links: vec![link(0, true), link(1, false), link(2, true)],
         };
         assert_eq!(snap.active_links(), 2);
@@ -555,6 +690,7 @@ mod tests {
             link_gbps: None,
             correctable_errors: None,
             uncorrectable_errors: None,
+            metrics: None,
             links: Vec::new(),
         };
         assert_eq!(snap.active_links(), 0);

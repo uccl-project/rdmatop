@@ -11,6 +11,7 @@ use super::app::{
     EXTRA_COUNTERS,
 };
 use super::theme::ThemeColors;
+use crate::gpu::GpuMetrics;
 
 const HELP_KEYS: &[(&str, &str)] = &[
     ("↑ / k", "Move up"),
@@ -260,12 +261,66 @@ fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
     // Scale to the port's line rate; fall back to a default when unknown.
     let max = link_gbps.filter(|&r| r > 0.0).unwrap_or(RDMA_LINK_GBPS);
     let ratio = (gbps / max).clamp(0.0, 1.0);
-    let filled = (ratio * BAR_WIDTH as f64).round() as usize;
+    ratio_bar(ratio, BAR_WIDTH)
+}
+
+/// Meter string for a 0..=1 ratio, `width` chars, glyph-mode aware.
+fn ratio_bar(ratio: f64, width: usize) -> String {
+    let filled = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
     let (fill, empty) = super::glyphs::meter();
-    let mut bar = String::with_capacity(BAR_WIDTH * fill.len_utf8());
+    let mut bar = String::with_capacity(width * fill.len_utf8());
     bar.extend(std::iter::repeat_n(fill, filled));
-    bar.extend(std::iter::repeat_n(empty, BAR_WIDTH - filled));
+    bar.extend(std::iter::repeat_n(empty, width - filled));
     bar
+}
+
+/// One " GPUs " panel line: name + util/mem gauges + temp/power/clock.
+fn gpu_gauge_line(dev: &str, name: &str, m: &GpuMetrics, tc: &ThemeColors) -> Line<'static> {
+    const GAUGE_W: usize = 16;
+    let mut spans = vec![styled(
+        &format!(" {:<8} {:<16} ", dev, truncate(name, 16)),
+        tc.fg,
+        false,
+    )];
+    match m.util_pct {
+        Some(u) => {
+            let r = u as f64 / 100.0;
+            spans.push(styled("Util[", tc.muted, false));
+            spans.push(styled(&ratio_bar(r, GAUGE_W), capacity_color(r, tc), false));
+            spans.push(styled(
+                &format!(" {:>3}%] ", u),
+                capacity_color(r, tc),
+                false,
+            ));
+        }
+        None => spans.push(styled("Util[ - ] ", tc.muted, false)),
+    }
+    match (m.vram_used_mb, m.vram_total_mb) {
+        (Some(u), Some(t)) if t > 0 => {
+            let r = u as f64 / t as f64;
+            spans.push(styled("Mem[", tc.muted, false));
+            spans.push(styled(&ratio_bar(r, GAUGE_W), capacity_color(r, tc), false));
+            spans.push(styled(
+                &format!(" {:.1}/{:.1}G] ", u as f64 / 1024.0, t as f64 / 1024.0),
+                capacity_color(r, tc),
+                false,
+            ));
+        }
+        _ => spans.push(styled("Mem[ - ] ", tc.muted, false)),
+    }
+    match m.temp_c {
+        Some(t) => spans.push(styled(&format!("{}C ", t), temp_color(t, tc), false)),
+        None => spans.push(styled("-C ", tc.muted, false)),
+    }
+    spans.push(match m.power_w {
+        Some(p) => styled(&format!("{:.0}W ", p), tc.fg, false),
+        None => styled("-W ", tc.muted, false),
+    });
+    spans.push(match m.clock_mhz {
+        Some(c) => styled(&format!("{}MHz", c), tc.fg, false),
+        None => styled("-MHz", tc.muted, false),
+    });
+    Line::from(spans)
 }
 
 fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
@@ -276,13 +331,13 @@ fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
         TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
-            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
+            .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
-            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
+            .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps))
-            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+            .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         TableColumn::RxGbps => Cell::from(format!("{:.2}", t.rx_gbps))
-            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+            .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         TableColumn::TxPps => {
             Cell::from(format_pps(t.tx_pkts_per_sec)).style(Style::default().fg(tc.fg))
         }
@@ -365,14 +420,26 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
         Cell::from(gpu_meta_name(t)).style(Style::default().fg(tc.muted)),
         Cell::from(t.port_label.clone().unwrap_or_default()).style(Style::default().fg(tc.fg)),
         Cell::from(speed).style(Style::default().fg(tc.fg)),
-        Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
-            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
-        Cell::from(format!("{:.2}", t.tx_gbps))
-            .style(Style::default().fg(gbps_color(t.tx_gbps, tc))),
-        Cell::from(gbps_bar(t.rx_gbps, t.link_gbps))
-            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
-        Cell::from(format!("{:.2}", t.rx_gbps))
-            .style(Style::default().fg(gbps_color(t.rx_gbps, tc))),
+        Cell::from(gbps_bar(t.tx_gbps, t.link_gbps)).style(Style::default().fg(throughput_color(
+            t.tx_gbps,
+            t.link_gbps,
+            tc,
+        ))),
+        Cell::from(format!("{:.2}", t.tx_gbps)).style(Style::default().fg(throughput_color(
+            t.tx_gbps,
+            t.link_gbps,
+            tc,
+        ))),
+        Cell::from(gbps_bar(t.rx_gbps, t.link_gbps)).style(Style::default().fg(throughput_color(
+            t.rx_gbps,
+            t.link_gbps,
+            tc,
+        ))),
+        Cell::from(format!("{:.2}", t.rx_gbps)).style(Style::default().fg(throughput_color(
+            t.rx_gbps,
+            t.link_gbps,
+            tc,
+        ))),
         Cell::from(gpu_errs(t)).style(Style::default().fg(tc.warning)),
     ]
 }
@@ -421,6 +488,36 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
     if display.is_empty() && !app.has_data {
         draw_startup_placeholder(frame, app, area, tc, title);
         return;
+    }
+
+    // Gauge strip above the table when any GPU reported health metrics.
+    let gauges: Vec<Line> = display
+        .iter()
+        .filter_map(|t| {
+            let (name, m) = match (&t.nvlink, &t.xgmi) {
+                (Some(nv), _) => (nv.gpu_name.as_str(), nv.metrics.as_ref()?),
+                (_, Some(xg)) => (xg.gpu_name.as_str(), xg.metrics.as_ref()?),
+                _ => return None,
+            };
+            Some(gpu_gauge_line(&t.dev_name, name, m, tc))
+        })
+        .collect();
+    let mut area = area;
+    if !gauges.is_empty() {
+        // Leave the link table at least 8 rows.
+        let strip_h = (gauges.len() as u16 + 2).min(area.height.saturating_sub(8));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(strip_h), Constraint::Min(0)])
+            .split(area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(super::glyphs::border())
+            .border_style(Style::default().fg(tc.border))
+            .title(" GPUs ")
+            .title_style(Style::default().fg(tc.accent));
+        frame.render_widget(Paragraph::new(gauges).block(block), chunks[0]);
+        area = chunks[1];
     }
 
     let header = Row::new(vec![
@@ -662,12 +759,18 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 }
 
 fn sparkline_str(data: &[f64], width: usize) -> String {
+    let max = data.iter().cloned().fold(0.0f64, f64::max);
+    sparkline_scaled(data, width, max)
+}
+
+/// Render a sparkline with a fixed `max` scale (e.g. 100.0 for percentages).
+fn sparkline_scaled(data: &[f64], width: usize, max: f64) -> String {
     // Height ramps by index 0..8; ASCII keeps the graph shape without a
     // mushy underline (idle reads as '.', not '_') in non-UTF-8 locales.
     const U: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     const A: &[char] = &[' ', '.', '.', ':', ':', '=', '=', '#', '#'];
     let bars = if super::glyphs::unicode() { U } else { A };
-    let max = data.iter().cloned().fold(0.0f64, f64::max).max(0.01);
+    let max = max.max(0.01);
     let start = data.len().saturating_sub(width);
     let mut s = String::with_capacity(width);
     for &v in &data[start..] {
@@ -679,6 +782,43 @@ fn sparkline_str(data: &[f64], width: usize) -> String {
         s.insert(0, ' ');
     }
     s
+}
+
+/// Append GPU health lines: util sparkline (fixed 0-100 scale) plus a
+/// temp/power/clock summary with '-' fallbacks for missing values.
+fn append_gpu_health(
+    lines: &mut Vec<Line<'static>>,
+    metrics: Option<&crate::gpu::GpuMetrics>,
+    history: Option<&super::app::DeviceHistory>,
+    spark_w: usize,
+    tc: &ThemeColors,
+) {
+    let Some(m) = metrics else { return };
+    if let Some(h) = history {
+        if !h.util.is_empty() {
+            let pct_span = match m.util_pct {
+                Some(u) => styled(
+                    &format!(" {}%", u),
+                    capacity_color(u as f64 / 100.0, tc),
+                    false,
+                ),
+                None => styled(" -%", tc.muted, false),
+            };
+            lines.push(Line::from(vec![
+                styled(" Util  ", tc.muted, false),
+                styled(&sparkline_scaled(&h.util, spark_w, 100.0), tc.accent, false),
+                pct_span,
+            ]));
+        }
+    }
+    let temp = m.temp_c.map_or("-".to_string(), |t| format!("{}C", t));
+    let pwr = m.power_w.map_or("-".to_string(), |p| format!("{:.0}W", p));
+    let clk = m.clock_mhz.map_or("-".to_string(), |c| format!("{}MHz", c));
+    lines.push(Line::from(styled(
+        &format!(" Temp {}  Pwr {}  Clk {}", temp, pwr, clk),
+        tc.fg,
+        false,
+    )));
 }
 
 fn build_detail_lines(
@@ -746,6 +886,8 @@ fn build_nvlink_detail_lines(
         styled(&format!("{:.2} Gbps ", t.rx_gbps), tc.accent, false),
         styled(&rx_spark, tc.accent, false),
     ]));
+
+    append_gpu_health(&mut lines, meta.metrics.as_ref(), history, spark_w, tc);
 
     lines.push(Line::from(""));
 
@@ -872,6 +1014,8 @@ fn build_xgmi_detail_lines(
         styled(&format!("{:.2} Gbps ", t.rx_gbps), tc.accent, false),
         styled(&rx_spark, tc.accent, false),
     ]));
+
+    append_gpu_health(&mut lines, meta.metrics.as_ref(), history, spark_w, tc);
 
     lines.push(Line::from(""));
 
@@ -1179,7 +1323,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 samples
             ))
             .into_owned(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
         ));
     } else if let Some(msg) = &app.record_status {
         spans.push(Span::styled(
@@ -1190,13 +1334,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     if let Some(err) = &app.sampler_error {
         spans.push(Span::styled(
             super::glyphs::tr(&format!(" sampler died: {} ", err)).into_owned(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
         ));
     } else if let Some(secs) = app.stale_secs() {
         // A wedged (not dead) sampler: data is old but still rendered.
         spans.push(Span::styled(
             format!(" STALE {}s - sampler stalled ", secs),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(tc.error).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(keys);
@@ -1386,6 +1530,41 @@ fn gbps_color(gbps: f64, tc: &ThemeColors) -> ratatui::style::Color {
     }
 }
 
+/// 5-step gradient by fraction of capacity: how close to full, not how big.
+fn capacity_color(ratio: f64, tc: &ThemeColors) -> ratatui::style::Color {
+    if ratio >= 0.85 {
+        tc.error
+    } else if ratio >= 0.70 {
+        tc.warning
+    } else if ratio >= 0.40 {
+        tc.good
+    } else if ratio >= 0.05 {
+        tc.good_dim
+    } else {
+        tc.muted
+    }
+}
+
+/// Color a throughput by % of link capacity; unknown capacity falls back
+/// to the absolute-Gbps rule so ports without a rate don't regress.
+fn throughput_color(gbps: f64, link_gbps: Option<f64>, tc: &ThemeColors) -> ratatui::style::Color {
+    match link_gbps.filter(|&c| c > 0.0) {
+        Some(cap) => capacity_color(gbps / cap, tc),
+        None => gbps_color(gbps, tc),
+    }
+}
+
+/// Fixed thermal thresholds (spec): <70C good, <85C warning, else error.
+fn temp_color(temp_c: i64, tc: &ThemeColors) -> ratatui::style::Color {
+    if temp_c >= 85 {
+        tc.error
+    } else if temp_c >= 70 {
+        tc.warning
+    } else {
+        tc.good
+    }
+}
+
 fn fmt_mem_kb(kb: u64) -> String {
     if kb >= 1_048_576 {
         format!("{:.1}G", kb as f64 / 1_048_576.0)
@@ -1533,6 +1712,7 @@ mod nvlink_detail_tests {
             gpu_name: "H100".to_string(),
             active_links: active,
             links: links.clone(),
+            metrics: None,
         };
         let port = PortThroughput {
             dev_name: dev_name.to_string(),
@@ -1823,6 +2003,7 @@ mod nvlink_detail_tests {
             gpu_name: "H100".to_string(),
             active_links: 2,
             links: links.clone(),
+            metrics: None,
         };
         let port = PortThroughput {
             dev_name: "nvidia0".to_string(),
@@ -1932,6 +2113,7 @@ mod nvlink_detail_tests {
             gpu_name: "H100".to_string(),
             active_links: 2,
             links: links.clone(),
+            metrics: None,
         };
         let port = PortThroughput {
             dev_name: "nvidia0".to_string(),
@@ -2014,6 +2196,7 @@ mod xgmi_detail_tests {
             gpu_name: "MI325X".to_string(),
             active_links: active,
             links,
+            metrics: None,
         };
         let port = PortThroughput {
             dev_name: "amdgpu0".to_string(),
@@ -2152,6 +2335,7 @@ mod gpu_table_tests {
                 gpu_name: "MI325X".to_string(),
                 active_links: 7,
                 links: vec![],
+                metrics: None,
             }),
             class: DeviceClass::Xgmi,
         }
@@ -2177,6 +2361,7 @@ mod gpu_table_tests {
                 gpu_name: "H100".to_string(),
                 active_links: 18,
                 links: vec![],
+                metrics: None,
             }),
             xgmi: None,
             class: DeviceClass::Nvlink,
@@ -2238,5 +2423,77 @@ mod gpu_table_tests {
         let mut row = nvlink_row(0, 0);
         row.counter_rates.clear();
         assert_eq!(gpu_errs(&row), "0");
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+
+    #[test]
+    fn capacity_color_steps() {
+        let tc = Theme::Default.colors();
+        assert_eq!(capacity_color(0.049, &tc), tc.muted);
+        assert_eq!(capacity_color(0.05, &tc), tc.good_dim);
+        assert_eq!(capacity_color(0.399, &tc), tc.good_dim);
+        assert_eq!(capacity_color(0.40, &tc), tc.good);
+        assert_eq!(capacity_color(0.699, &tc), tc.good);
+        assert_eq!(capacity_color(0.70, &tc), tc.warning);
+        assert_eq!(capacity_color(0.849, &tc), tc.warning);
+        assert_eq!(capacity_color(0.85, &tc), tc.error);
+    }
+
+    #[test]
+    fn throughput_color_falls_back_to_absolute_without_capacity() {
+        let tc = Theme::Default.colors();
+        // 388 Gbps on a 400G link: saturated -> error.
+        assert_eq!(throughput_color(388.0, Some(400.0), &tc), tc.error);
+        // Same rate, unknown capacity: old absolute rule (>=10 -> good).
+        assert_eq!(throughput_color(388.0, None, &tc), tc.good);
+        assert_eq!(throughput_color(0.4, None, &tc), tc.muted);
+    }
+
+    #[test]
+    fn temp_color_thresholds() {
+        let tc = Theme::Default.colors();
+        assert_eq!(temp_color(69, &tc), tc.good);
+        assert_eq!(temp_color(70, &tc), tc.warning);
+        assert_eq!(temp_color(84, &tc), tc.warning);
+        assert_eq!(temp_color(85, &tc), tc.error);
+    }
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use super::*;
+    use crate::gpu::GpuMetrics;
+    use crate::tui::theme::Theme;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn gauge_line_formats_metrics_and_dashes_missing() {
+        let tc = Theme::Default.colors();
+        let m = GpuMetrics {
+            util_pct: Some(87),
+            vram_used_mb: Some(69_837),
+            vram_total_mb: Some(81_920),
+            temp_c: Some(72),
+            power_w: Some(540.0),
+            clock_mhz: None,
+        };
+        let text = line_text(&gpu_gauge_line("nvidia0", "NVIDIA GB10", &m, &tc));
+        assert!(text.contains("nvidia0"), "{text:?}");
+        assert!(text.contains("87%"), "{text:?}");
+        assert!(text.contains("68.2/80.0G"), "{text:?}");
+        assert!(text.contains("72C"), "{text:?}");
+        assert!(text.contains("540W"), "{text:?}");
+        assert!(
+            text.contains("-MHz"),
+            "missing clock renders '-MHz': {text:?}"
+        );
     }
 }

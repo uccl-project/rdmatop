@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{LazyLock, Mutex, OnceLock};
 
+use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::enum_wrappers::nv_link::{ErrorCounter, IntDeviceType};
 use nvml_wrapper::enums::device::SampleValue;
 use nvml_wrapper::structs::device::FieldId;
@@ -132,6 +133,8 @@ fn link_meta(
 pub struct NvLinkSnapshot {
     pub gpu_index: u32,
     pub gpu_name: String,
+    /// Live GPU health (util/vram/temp/power/clock) for the gauge strip.
+    pub metrics: Option<crate::gpu::GpuMetrics>,
     /// Total number of NVLink ports exposed by the GPU (active + inactive).
     pub link_count: u32,
     /// Negotiated aggregate speed in Gbps, derived from the per-link
@@ -210,6 +213,22 @@ pub fn read_all_nvlink_stats() -> io::Result<Vec<NvLinkSnapshot>> {
     Ok(snapshots)
 }
 
+/// Live GPU health via safe NVML wrappers; absent readings become None.
+fn read_gpu_metrics(device: &nvml_wrapper::Device<'_>) -> crate::gpu::GpuMetrics {
+    let mem = device.memory_info().ok();
+    crate::gpu::GpuMetrics {
+        util_pct: device.utilization_rates().ok().map(|u| u.gpu),
+        vram_used_mb: mem.as_ref().map(|m| m.used / (1024 * 1024)),
+        vram_total_mb: mem.as_ref().map(|m| m.total / (1024 * 1024)),
+        temp_c: device
+            .temperature(TemperatureSensor::Gpu)
+            .ok()
+            .map(|t| t as i64),
+        power_w: device.power_usage().ok().map(|mw| mw as f64 / 1000.0),
+        clock_mhz: device.clock_info(Clock::Graphics).ok(),
+    }
+}
+
 fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
     let device = nvml.device_by_index(idx).ok()?;
     let gpu_name = device.name().unwrap_or_default();
@@ -262,6 +281,7 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
     Some(NvLinkSnapshot {
         gpu_index: idx,
         gpu_name,
+        metrics: Some(read_gpu_metrics(&device)),
         link_count,
         link_gbps: if total_speed_gbps > 0.0 {
             Some(total_speed_gbps)
@@ -440,6 +460,7 @@ mod tests {
         let snap = NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "test".to_string(),
+            metrics: None,
             link_count: 4,
             link_gbps: None,
             tx_bytes: None,
@@ -494,6 +515,7 @@ mod tests {
         let snap = NvLinkSnapshot {
             gpu_index: 0,
             gpu_name: "test".to_string(),
+            metrics: None,
             link_count: 0,
             link_gbps: None,
             tx_bytes: None,
