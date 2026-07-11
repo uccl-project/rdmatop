@@ -2,13 +2,13 @@ mod net;
 mod netlink;
 mod nvlink;
 mod rdma;
+mod sampler;
 mod stat;
 mod trace;
 mod tui;
 mod xgmi;
 
 use std::io;
-use std::time::Instant;
 
 fn run_tui() -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
@@ -19,23 +19,25 @@ fn run_tui() -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut app = tui::app::App::new();
-
-    let mut last_refresh = Instant::now() - app.refresh_interval;
+    let mut sampler = sampler::Sampler::spawn(app.refresh_interval);
 
     loop {
-        if last_refresh.elapsed() >= app.refresh_interval {
-            app.refresh_stats();
-            last_refresh = Instant::now();
+        if let Some(snap) = sampler.try_latest() {
+            app.apply_snapshot(snap);
         }
+        app.sampler_dead = sampler.is_dead();
 
         terminal.draw(|frame| tui::ui::draw(frame, &mut app))?;
         tui::events::handle_events(&mut app)?;
+        // `<`/`>` change app.refresh_interval; mirror it to the thread.
+        sampler.set_interval(app.refresh_interval);
 
         if app.should_quit {
             break;
         }
     }
 
+    sampler.stop();
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
