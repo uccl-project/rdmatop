@@ -38,9 +38,9 @@ impl Recorder {
     }
 
     /// Record one interval's metrics, timestamped relative to record start.
-    /// `taken_at` is when the counters were read (sampler-side), so trace
-    /// spacing is immune to UI queue and event-poll latency; a sample taken
-    /// before recording started saturates to ts 0.
+    /// `taken_at` is the sampling pass start (sampler-side), so trace spacing
+    /// is immune to UI queue and event-poll latency; a sample taken before
+    /// recording started saturates to ts 0.
     pub fn push(&mut self, taken_at: Instant, ports: Vec<PortMetrics>) {
         let ts_us = taken_at.saturating_duration_since(self.start).as_micros() as u64;
         self.samples.push(TraceSample { ts_us, ports });

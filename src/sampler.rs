@@ -72,7 +72,7 @@ impl Sampler {
     pub fn spawn(interval: Duration) -> Self {
         let shared = Arc::new(Shared {
             slot: Mutex::new(None),
-            interval_ms: AtomicU64::new(interval.as_millis() as u64),
+            interval_ms: AtomicU64::new(interval_to_ms(interval)),
             stop: AtomicBool::new(false),
             died: Mutex::new(None),
         });
@@ -102,7 +102,7 @@ impl Sampler {
     pub fn set_interval(&self, interval: Duration) {
         self.shared
             .interval_ms
-            .store(interval.as_millis() as u64, Ordering::Relaxed);
+            .store(interval_to_ms(interval), Ordering::Relaxed);
     }
 
     /// Ask the thread to exit. Detach, never join: a thread stuck inside a
@@ -118,6 +118,12 @@ impl Drop for Sampler {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Interval as stored millis, clamped to 1ms: a zero value would make the
+/// sampling loop spin with no sleep at all.
+fn interval_to_ms(interval: Duration) -> u64 {
+    (interval.as_millis() as u64).max(1)
 }
 
 /// Render a `catch_unwind` payload (typically &str or String) for the UI.

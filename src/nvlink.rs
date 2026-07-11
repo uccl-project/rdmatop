@@ -167,13 +167,20 @@ const LINK_SPEED_FIELD_IDS: [u32; 12] = [
 
 /// dlopen + nvmlInit once, kept for the process lifetime (nvmlShutdown is
 /// never called; process exit tears it down). A failed init retries on the
-/// next poll so a driver that loads after startup is still picked up.
+/// next poll; the lock serializes init so racing callers can never build
+/// and drop a second Nvml instance.
 fn nvml() -> Option<&'static Nvml> {
     static INSTANCE: OnceLock<Nvml> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
     if let Some(n) = INSTANCE.get() {
         return Some(n);
     }
-    Nvml::init().ok().map(|n| INSTANCE.get_or_init(|| n))
+    let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = INSTANCE.get() {
+        return Some(n);
+    }
+    let n = Nvml::init().ok()?;
+    Some(INSTANCE.get_or_init(|| n))
 }
 
 /// Read NVLink statistics for every GPU in the system.
