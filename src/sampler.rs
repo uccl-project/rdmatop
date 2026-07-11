@@ -8,17 +8,20 @@ use std::time::{Duration, Instant};
 
 use crate::{net, nvlink, stat, xgmi};
 
-/// One subsystem's reading stamped right at its own read, so rate math
-/// never absorbs another subsystem's latency (e.g. a driver init earlier
-/// in the same pass).
+/// One subsystem's reading, stamped as its read completes, so rate math
+/// never absorbs another subsystem's latency nor this one's own lazy
+/// setup (e.g. first-time driver init runs before the counters are read).
 pub struct Sample<T> {
     pub data: T,
     pub taken_at: Instant,
 }
 
 fn sample<T>(read: impl FnOnce() -> std::io::Result<T>) -> Option<Sample<T>> {
-    let taken_at = Instant::now();
-    read().ok().map(|data| Sample { data, taken_at })
+    let data = read().ok()?;
+    Some(Sample {
+        data,
+        taken_at: Instant::now(),
+    })
 }
 
 /// Everything one sampling pass produces. Raw counters only; delta/rate
