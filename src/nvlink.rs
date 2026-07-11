@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use nvml_wrapper::enum_wrappers::nv_link::{ErrorCounter, IntDeviceType};
 use nvml_wrapper::enums::device::SampleValue;
@@ -85,7 +85,8 @@ pub struct LinkSnapshot {
 }
 
 /// Static per-(gpu, link) facts that cannot change while the driver is
-/// loaded. Cached on first successful read; failures retry next poll.
+/// loaded. Cached once fully resolved; partial replies retry next poll.
+/// (`remote_pci_bdf` is optional: some remotes report no BDF at all.)
 #[derive(Clone)]
 struct LinkMeta {
     version: Option<u32>,
@@ -101,9 +102,9 @@ fn link_meta(
     link_id: u32,
     common_speed_gbps: Option<f64>,
 ) -> LinkMeta {
-    static CACHE: Mutex<Option<HashMap<(u32, u32), LinkMeta>>> = Mutex::new(None);
+    static CACHE: LazyLock<Mutex<HashMap<(u32, u32), LinkMeta>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = cache.get_or_insert_with(HashMap::new);
     if let Some(meta) = cache.get(&(gpu, link_id)) {
         return meta.clone();
     }
@@ -114,12 +115,12 @@ fn link_meta(
         remote_pci_bdf: nvlink.remote_pci_info().ok().map(|p| p.bus_id),
         speed_gbps: read_link_speed_gbps(device, link_id).or(common_speed_gbps),
     };
-    // Only cache when the driver answered something; all-empty replies
-    // (e.g. during early link training) retry on the next poll.
+    // Cache only fully-resolved replies: a partial answer during link
+    // training (e.g. version ok, speed still 0) must retry next poll, or
+    // the missing fields would be frozen for the process lifetime.
     if meta.version.is_some()
-        || meta.remote_device_type != RemoteDeviceType::Unknown
-        || meta.remote_pci_bdf.is_some()
-        || meta.speed_gbps.is_some()
+        && meta.remote_device_type != RemoteDeviceType::Unknown
+        && meta.speed_gbps.is_some()
     {
         cache.insert((gpu, link_id), meta.clone());
     }
@@ -164,11 +165,15 @@ const LINK_SPEED_FIELD_IDS: [u32; 12] = [
     NVML_FI_DEV_NVLINK_SPEED_MBPS_L11,
 ];
 
-/// dlopen + nvmlInit exactly once per process; nvmlShutdown is never called
-/// (process exit tears it down). A failed init is cached as `None`.
+/// dlopen + nvmlInit once, kept for the process lifetime (nvmlShutdown is
+/// never called; process exit tears it down). A failed init retries on the
+/// next poll so a driver that loads after startup is still picked up.
 fn nvml() -> Option<&'static Nvml> {
-    static INSTANCE: OnceLock<Option<Nvml>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Nvml::init().ok()).as_ref()
+    static INSTANCE: OnceLock<Nvml> = OnceLock::new();
+    if let Some(n) = INSTANCE.get() {
+        return Some(n);
+    }
+    Nvml::init().ok().map(|n| INSTANCE.get_or_init(|| n))
 }
 
 /// Read NVLink statistics for every GPU in the system.

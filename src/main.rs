@@ -19,13 +19,15 @@ fn run_tui() -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut app = tui::app::App::new();
-    let mut sampler = sampler::Sampler::spawn(app.refresh_interval);
+    let sampler = sampler::Sampler::spawn(app.refresh_interval);
 
     loop {
         if let Some(snap) = sampler.try_latest() {
             app.apply_snapshot(snap);
         }
-        app.sampler_dead = sampler.is_dead();
+        if app.sampler_error.is_none() {
+            app.sampler_error = sampler.death_reason();
+        }
 
         terminal.draw(|frame| tui::ui::draw(frame, &mut app))?;
         tui::events::handle_events(&mut app)?;

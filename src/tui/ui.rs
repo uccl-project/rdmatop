@@ -377,6 +377,32 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
     ]
 }
 
+/// Bordered placeholder shown in a table area before the first snapshot:
+/// "initializing" while the sampler is warming up, "failed" once it died.
+fn draw_startup_placeholder(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    tc: &ThemeColors,
+    title: String,
+) {
+    let text = if app.sampler_error.is_some() {
+        "sampling failed - see status bar"
+    } else {
+        "initializing devices..."
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
+        .border_style(Style::default().fg(tc.border))
+        .title(title)
+        .title_style(Style::default().fg(tc.accent));
+    let msg = Paragraph::new(text)
+        .style(Style::default().fg(tc.muted))
+        .block(block);
+    frame.render_widget(msg, area);
+}
+
 /// GPU-tab table: fixed columns for XGMI / NVLink rows.
 /// h-scroll and the column picker are RDMA-only; this function ignores both.
 fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
@@ -393,16 +419,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
 
     // Before the first background-sampler snapshot arrives, show a placeholder.
     if display.is_empty() && !app.has_data {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_set(super::glyphs::border())
-            .border_style(Style::default().fg(tc.border))
-            .title(title)
-            .title_style(Style::default().fg(tc.accent));
-        let msg = Paragraph::new("initializing devices...")
-            .style(Style::default().fg(tc.muted))
-            .block(block);
-        frame.render_widget(msg, area);
+        draw_startup_placeholder(frame, app, area, tc, title);
         return;
     }
 
@@ -497,16 +514,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     // Before the first background-sampler snapshot arrives, show a placeholder.
     if display.is_empty() && !app.has_data {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_set(super::glyphs::border())
-            .border_style(Style::default().fg(tc.border))
-            .title(title)
-            .title_style(Style::default().fg(tc.accent));
-        let msg = Paragraph::new("initializing devices...")
-            .style(Style::default().fg(tc.muted))
-            .block(block);
-        frame.render_widget(msg, area);
+        draw_startup_placeholder(frame, app, area, tc, title);
         return;
     }
 
@@ -1179,9 +1187,15 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             Style::default().fg(tc.fg),
         ));
     }
-    if app.sampler_dead {
+    if let Some(err) = &app.sampler_error {
         spans.push(Span::styled(
-            " sampler stopped - data frozen ",
+            super::glyphs::tr(&format!(" sampler died: {} ", err)).into_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(secs) = app.stale_secs() {
+        // A wedged (not dead) sampler: data is old but still rendered.
+        spans.push(Span::styled(
+            format!(" STALE {}s - sampler stalled ", secs),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }

@@ -1,8 +1,6 @@
 use crate::netlink::*;
 use crate::rdma::*;
-use std::collections::HashMap;
 use std::io;
-use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
 /// A single hardware counter name/value pair.
@@ -97,21 +95,13 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
 }
 
 /// Parse the port line rate from sysfs, e.g. "400 Gb/sec (4X NDR)" -> 400.0.
-/// The rate is static while the link is up; successful reads are cached,
-/// failed reads retry next poll (link may still be training at startup).
+/// Read fresh every poll on purpose: a down port reports an SDR placeholder
+/// and links can retrain at a different speed, so caching would freeze a
+/// wrong utilization denominator for the process lifetime.
 fn read_port_link_gbps(dev_name: &str, port: u32) -> Option<f64> {
-    static CACHE: Mutex<Option<HashMap<(String, u32), f64>>> = Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = cache.get_or_insert_with(HashMap::new);
-    let key = (dev_name.to_string(), port);
-    if let Some(&gbps) = cache.get(&key) {
-        return Some(gbps);
-    }
     let path = format!("/sys/class/infiniband/{}/ports/{}/rate", dev_name, port);
     let raw = std::fs::read_to_string(path).ok()?;
-    let gbps = raw.split_whitespace().next()?.parse::<f64>().ok()?;
-    cache.insert(key, gbps);
-    Some(gbps)
+    raw.split_whitespace().next()?.parse::<f64>().ok()
 }
 
 // Names whose values in /sys/.../counters/ are in 4-byte words per IB spec.
