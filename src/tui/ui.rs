@@ -262,9 +262,9 @@ fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
     let ratio = (gbps / max).clamp(0.0, 1.0);
     let filled = (ratio * BAR_WIDTH as f64).round() as usize;
     let (fill, empty) = super::glyphs::meter();
-    let mut bar = String::with_capacity(BAR_WIDTH);
-    bar.extend(std::iter::repeat(fill).take(filled));
-    bar.extend(std::iter::repeat(empty).take(BAR_WIDTH - filled));
+    let mut bar = String::with_capacity(BAR_WIDTH * fill.len_utf8());
+    bar.extend(std::iter::repeat_n(fill, filled));
+    bar.extend(std::iter::repeat_n(empty, BAR_WIDTH - filled));
     bar
 }
 
@@ -1347,11 +1347,15 @@ fn fmt_mem_kb(kb: u64) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}{}", &s[..max - 1], super::glyphs::tr("…"))
+    // Count chars, not bytes: byte slicing panics mid-codepoint, and the
+    // ellipsis is 3 chars ("...") in ASCII mode, so budget for its width.
+    if s.chars().count() <= max {
+        return s.to_string();
     }
+    let dots = super::glyphs::tr("…");
+    let keep = max.saturating_sub(dots.chars().count());
+    let cut: String = s.chars().take(keep).collect();
+    format!("{cut}{dots}")
 }
 
 #[cfg(test)]

@@ -19,9 +19,13 @@ pub fn unicode() -> bool {
 /// raw mode with the alternate screen active. Inside tmux we trust its client
 /// flag; otherwise we probe the terminal, then fall back to the locale.
 pub fn detect() {
-    let ok = tmux_utf8() // authoritative inside tmux
-        .or_else(probe) // else ask the real terminal
-        .unwrap_or_else(locale_utf8);
+    // The probe is fooled inside tmux (see tmux_utf8), so when the tmux
+    // query itself fails we must fall back to the locale, never the probe.
+    let ok = if std::env::var_os("TMUX").is_some() {
+        tmux_utf8().unwrap_or_else(locale_utf8)
+    } else {
+        probe().unwrap_or_else(locale_utf8)
+    };
     let _ = UNICODE.set(ok);
 }
 
@@ -31,11 +35,27 @@ pub fn detect() {
 /// `#{client_utf8}` is the only signal that reflects what reaches the terminal.
 /// `None` when not under tmux, or no client is attached to answer.
 fn tmux_utf8() -> Option<bool> {
+    use std::process::{Command, Stdio};
     std::env::var_os("TMUX")?;
-    let out = std::process::Command::new("tmux")
+    let mut child = Command::new("tmux")
         .args(["display-message", "-p", "#{client_utf8}"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    // Raw mode already disabled Ctrl-C, so a wedged tmux server must not
+    // block startup forever: kill the query if it outlives the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().ok()?;
     match out.stdout.first().copied()? {
         b'1' => Some(true),
         b'0' => Some(false),
