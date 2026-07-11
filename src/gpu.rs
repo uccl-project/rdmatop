@@ -11,3 +11,11 @@ pub struct GpuMetrics {
     pub power_w: Option<f64>,
     pub clock_mhz: Option<u32>,
 }
+
+impl GpuMetrics {
+    /// True when no reading is available at all; readers report None then,
+    /// so the UI skips the gauge line instead of rendering all dashes.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}

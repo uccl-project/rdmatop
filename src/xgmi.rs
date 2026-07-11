@@ -527,7 +527,7 @@ fn read_processor_snapshot(
         link_gbps: (total_gbps > 0.0).then_some(total_gbps),
         correctable_errors,
         uncorrectable_errors,
-        metrics: Some(read_gpu_metrics(api, handle)),
+        metrics: Some(read_gpu_metrics(api, handle)).filter(|m| !m.is_empty()),
         links,
     })
 }

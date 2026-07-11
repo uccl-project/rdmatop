@@ -281,7 +281,7 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
     Some(NvLinkSnapshot {
         gpu_index: idx,
         gpu_name,
-        metrics: Some(read_gpu_metrics(&device)),
+        metrics: Some(read_gpu_metrics(&device)).filter(|m| !m.is_empty()),
         link_count,
         link_gbps: if total_speed_gbps > 0.0 {
             Some(total_speed_gbps)

@@ -759,7 +759,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 }
 
 fn sparkline_str(data: &[f64], width: usize) -> String {
-    let max = data.iter().cloned().fold(0.0f64, f64::max);
+    let max = data.iter().copied().fold(0.0f64, f64::max);
     sparkline_scaled(data, width, max)
 }
 
