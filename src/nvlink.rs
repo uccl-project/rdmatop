@@ -5,7 +5,9 @@
 //! throughput is read via the raw `nvmlDeviceGetFieldValues` entry point
 //! because `nvml-wrapper` does not expose a safe helper for those field IDs.
 
+use std::collections::HashMap;
 use std::io;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use nvml_wrapper::enum_wrappers::nv_link::{ErrorCounter, IntDeviceType};
 use nvml_wrapper::enums::device::SampleValue;
@@ -82,6 +84,49 @@ pub struct LinkSnapshot {
     pub recovery_error_count: Option<u64>,
 }
 
+/// Static per-(gpu, link) facts that cannot change while the driver is
+/// loaded. Cached once fully resolved; partial replies retry next poll.
+/// (`remote_pci_bdf` is optional: some remotes report no BDF at all.)
+#[derive(Clone)]
+struct LinkMeta {
+    version: Option<u32>,
+    remote_device_type: RemoteDeviceType,
+    remote_pci_bdf: Option<String>,
+    speed_gbps: Option<f64>,
+}
+
+fn link_meta(
+    nvml: &Nvml,
+    device: &nvml_wrapper::Device<'_>,
+    gpu: u32,
+    link_id: u32,
+    common_speed_gbps: Option<f64>,
+) -> LinkMeta {
+    static CACHE: LazyLock<Mutex<HashMap<(u32, u32), LinkMeta>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(meta) = cache.get(&(gpu, link_id)) {
+        return meta.clone();
+    }
+    let nvlink = device.link_wrapper_for(link_id);
+    let meta = LinkMeta {
+        version: nvlink.version().ok(),
+        remote_device_type: read_remote_device_type(nvml, device, link_id),
+        remote_pci_bdf: nvlink.remote_pci_info().ok().map(|p| p.bus_id),
+        speed_gbps: read_link_speed_gbps(device, link_id).or(common_speed_gbps),
+    };
+    // Cache only fully-resolved replies: a partial answer during link
+    // training (e.g. version ok, speed still 0) must retry next poll, or
+    // the missing fields would be frozen for the process lifetime.
+    if meta.version.is_some()
+        && meta.remote_device_type != RemoteDeviceType::Unknown
+        && meta.speed_gbps.is_some()
+    {
+        cache.insert((gpu, link_id), meta.clone());
+    }
+    meta
+}
+
 /// Snapshot of every NVLink attached to one GPU.
 #[derive(Clone, Debug)]
 pub struct NvLinkSnapshot {
@@ -120,6 +165,24 @@ const LINK_SPEED_FIELD_IDS: [u32; 12] = [
     NVML_FI_DEV_NVLINK_SPEED_MBPS_L11,
 ];
 
+/// dlopen + nvmlInit once, kept for the process lifetime (nvmlShutdown is
+/// never called; process exit tears it down). A failed init retries on the
+/// next poll; the lock serializes init so racing callers can never build
+/// and drop a second Nvml instance.
+fn nvml() -> Option<&'static Nvml> {
+    static INSTANCE: OnceLock<Nvml> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    if let Some(n) = INSTANCE.get() {
+        return Some(n);
+    }
+    let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = INSTANCE.get() {
+        return Some(n);
+    }
+    let n = Nvml::init().ok()?;
+    Some(INSTANCE.get_or_init(|| n))
+}
+
 /// Read NVLink statistics for every GPU in the system.
 ///
 /// If NVML cannot be initialised (e.g. no NVIDIA driver loaded), an empty
@@ -127,9 +190,9 @@ const LINK_SPEED_FIELD_IDS: [u32; 12] = [
 /// Per-GPU or per-link failures are skipped silently and the remaining data
 /// is still returned.
 pub fn read_all_nvlink_stats() -> io::Result<Vec<NvLinkSnapshot>> {
-    let nvml = match Nvml::init() {
-        Ok(n) => n,
-        Err(_) => return Ok(Vec::new()),
+    let nvml = match nvml() {
+        Some(n) => n,
+        None => return Ok(Vec::new()),
     };
 
     let device_count = match nvml.device_count() {
@@ -139,7 +202,7 @@ pub fn read_all_nvlink_stats() -> io::Result<Vec<NvLinkSnapshot>> {
 
     let mut snapshots = Vec::with_capacity(device_count as usize);
     for idx in 0..device_count {
-        if let Some(snap) = read_device_snapshot(&nvml, idx) {
+        if let Some(snap) = read_device_snapshot(nvml, idx) {
             snapshots.push(snap);
         }
     }
@@ -159,29 +222,33 @@ fn read_device_snapshot(nvml: &Nvml, idx: u32) -> Option<NvLinkSnapshot> {
     for link_id in 0..link_count {
         let nvlink = device.link_wrapper_for(link_id);
         let is_active = nvlink.is_active().unwrap_or(false);
-        let version = nvlink.version().ok();
-        let remote_device_type = read_remote_device_type(nvml, &device, link_id);
-        let remote_pci_bdf = nvlink.remote_pci_info().ok().map(|p| p.bus_id);
+        // Static facts are cached; inactive links skip them entirely
+        // (matching the old behavior of speed, extended to all metadata).
+        let meta = if is_active {
+            link_meta(nvml, &device, idx, link_id, common_speed_gbps)
+        } else {
+            LinkMeta {
+                version: None,
+                remote_device_type: RemoteDeviceType::Unknown,
+                remote_pci_bdf: None,
+                speed_gbps: None,
+            }
+        };
         let crc_error_count = nvlink.error_counter(ErrorCounter::DlCrcFlit).ok();
         let replay_error_count = nvlink.error_counter(ErrorCounter::DlReplay).ok();
         let recovery_error_count = nvlink.error_counter(ErrorCounter::DlRecovery).ok();
         let (tx_bytes, rx_bytes) = read_link_throughput(nvml, &device, link_id);
-        let speed_gbps = if is_active {
-            read_link_speed_gbps(&device, link_id).or(common_speed_gbps)
-        } else {
-            None
-        };
-        if let Some(s) = speed_gbps {
+        if let Some(s) = meta.speed_gbps {
             total_speed_gbps += s;
         }
 
         links.push(LinkSnapshot {
             link_id,
             is_active,
-            version,
-            speed_gbps,
-            remote_device_type,
-            remote_pci_bdf,
+            version: meta.version,
+            speed_gbps: meta.speed_gbps,
+            remote_device_type: meta.remote_device_type,
+            remote_pci_bdf: meta.remote_pci_bdf,
             tx_bytes,
             rx_bytes,
             crc_error_count,

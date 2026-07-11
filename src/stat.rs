@@ -95,6 +95,9 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
 }
 
 /// Parse the port line rate from sysfs, e.g. "400 Gb/sec (4X NDR)" -> 400.0.
+/// Read fresh every poll on purpose: a down port reports an SDR placeholder
+/// and links can retrain at a different speed, so caching would freeze a
+/// wrong utilization denominator for the process lifetime.
 fn read_port_link_gbps(dev_name: &str, port: u32) -> Option<f64> {
     let path = format!("/sys/class/infiniband/{}/ports/{}/rate", dev_name, port);
     let raw = std::fs::read_to_string(path).ok()?;

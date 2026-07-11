@@ -252,10 +252,13 @@ pub fn read_all_xgmi_stats() -> io::Result<Vec<XgmiSnapshot>> {
     let bdfs: Vec<Option<u64>> = handles.iter().map(|&h| read_bdf(api, h)).collect();
     let names = gpu_names(api, &handles);
     let speeds = link_speeds(api, &handles);
+    let peers = xgmi_peers(api, &handles);
 
     let mut snapshots = Vec::with_capacity(handles.len());
     for idx in 0..handles.len() {
-        if let Some(snap) = read_processor_snapshot(api, &handles, &bdfs, names, &speeds, idx) {
+        if let Some(snap) =
+            read_processor_snapshot(api, &handles, &bdfs, names, &speeds, &peers, idx)
+        {
             snapshots.push(snap);
         }
     }
@@ -273,6 +276,37 @@ fn gpu_names(api: &Amdsmi, handles: &[ffi::ProcessorHandle]) -> &'static [String
             .map(|&h| read_gpu_name(api, h).unwrap_or_default())
             .collect()
     })
+}
+
+/// XGMI peer adjacency, row-major [src][dst]. Topology is static while the
+/// driver is loaded, so the O(N^2) topo sweep is cached — but only once every
+/// call answered and only while the GPU count matches (retry/rebuild otherwise).
+fn xgmi_peers(api: &Amdsmi, handles: &[ffi::ProcessorHandle]) -> Vec<Vec<bool>> {
+    static PEERS: Mutex<Option<Vec<Vec<bool>>>> = Mutex::new(None);
+    let mut cached = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = cached.as_ref() {
+        if m.len() == handles.len() {
+            return m.clone();
+        }
+    }
+    let n = handles.len();
+    let mut matrix = vec![vec![false; n]; n];
+    let mut complete = true;
+    for src in 0..n {
+        for dst in 0..n {
+            if src == dst {
+                continue;
+            }
+            match is_xgmi_peer(api, handles[src], handles[dst]) {
+                Some(peer) => matrix[src][dst] = peer,
+                None => complete = false,
+            }
+        }
+    }
+    if complete && n > 0 {
+        *cached = Some(matrix.clone());
+    }
+    matrix
 }
 
 /// Per-link (bit_rate, bandwidth) in Gb/s from PCIe static info.
@@ -350,6 +384,7 @@ fn read_processor_snapshot(
     bdfs: &[Option<u64>],
     names: &[String],
     speeds: &[LinkSpeed],
+    peers: &[Vec<bool>],
     idx: usize,
 ) -> Option<XgmiSnapshot> {
     let handle = handles[idx];
@@ -367,8 +402,14 @@ fn read_processor_snapshot(
     let n = (metrics.num_links as usize).min(ffi::AMDSMI_MAX_NUM_XGMI_PHYSICAL_LINK);
     let mut links = Vec::new();
     let mut total_gbps = 0.0;
-    for (peer_idx, &peer) in handles.iter().enumerate() {
-        if peer_idx == idx || !is_xgmi_peer(api, handle, peer) {
+    for (peer_idx, peer_bdf) in bdfs.iter().enumerate() {
+        if peer_idx == idx
+            || !peers
+                .get(idx)
+                .and_then(|row| row.get(peer_idx))
+                .copied()
+                .unwrap_or(false)
+        {
             continue;
         }
         // Accumulators are indexed by destination GPU; peers beyond the
@@ -376,14 +417,10 @@ fn read_processor_snapshot(
         // The positional mapping is trusted only while the entry's own bdf
         // is unset (always zero on ROCm 6.4) or agrees with the peer's.
         let (tx_bytes, rx_bytes) = match metrics.links.get(peer_idx) {
-            Some(entry)
-                if peer_idx < n && (entry.bdf == 0 || Some(entry.bdf) == bdfs[peer_idx]) =>
-            {
-                (
-                    Some(entry.write_kb.wrapping_mul(1024)),
-                    Some(entry.read_kb.wrapping_mul(1024)),
-                )
-            }
+            Some(entry) if peer_idx < n && (entry.bdf == 0 || Some(entry.bdf) == *peer_bdf) => (
+                Some(entry.write_kb.wrapping_mul(1024)),
+                Some(entry.read_kb.wrapping_mul(1024)),
+            ),
             _ => (None, None),
         };
         total_gbps += speed_gbps.unwrap_or(0.0);
@@ -394,7 +431,7 @@ fn read_processor_snapshot(
             is_active: true,
             speed_gbps,
             bit_rate_gbps,
-            remote_pci_bdf: bdfs[peer_idx].map(format_bdf),
+            remote_pci_bdf: peer_bdf.map(format_bdf),
             tx_bytes,
             rx_bytes,
         });
@@ -416,12 +453,21 @@ fn read_processor_snapshot(
     })
 }
 
-/// True when topology reports an XGMI io-link between the two GPUs.
-fn is_xgmi_peer(api: &Amdsmi, src: ffi::ProcessorHandle, dst: ffi::ProcessorHandle) -> bool {
+/// Whether topology reports an XGMI io-link between the two GPUs.
+/// `None` when the topo query itself failed (transient during GPU init),
+/// so callers can retry instead of caching a false negative.
+fn is_xgmi_peer(
+    api: &Amdsmi,
+    src: ffi::ProcessorHandle,
+    dst: ffi::ProcessorHandle,
+) -> Option<bool> {
     let mut hops: u64 = 0;
     let mut link_type: u32 = 0;
     let rc = unsafe { (api.topo_get_link_type)(src, dst, &mut hops, &mut link_type) };
-    rc == ffi::AMDSMI_STATUS_SUCCESS && link_type == ffi::AMDSMI_IOLINK_TYPE_XGMI
+    if rc != ffi::AMDSMI_STATUS_SUCCESS {
+        return None;
+    }
+    Some(link_type == ffi::AMDSMI_IOLINK_TYPE_XGMI)
 }
 
 /// Per-link (bit_rate, bandwidth) in Gb/s from PCIe static info, mirroring

@@ -144,8 +144,9 @@ impl TableColumn {
 
 pub const BAR_WIDTH: usize = 12;
 
-/// Stats refresh interval bounds (seconds). Floor matches the 200ms event-poll
-/// so input stays responsive even at the fastest setting.
+/// Stats refresh interval bounds (seconds). Sampling runs on a background
+/// thread, so the floor only bounds sampler load; it must stay above the
+/// 0.1s duplicate-snapshot guard in `apply_snapshot`.
 pub const REFRESH_DEFAULT_SECS: f64 = 1.0;
 const REFRESH_MIN_SECS: f64 = 0.2;
 const REFRESH_MAX_SECS: f64 = 10.0;
@@ -356,7 +357,21 @@ pub struct App {
     pub cpu_history: Vec<f32>,
     prev_stats: Vec<PortStat>,
     prev_ifstats: Vec<IfStats>,
-    prev_time: Instant,
+    // Per-subsystem baselines: each timestamp marks when its subsystem last
+    // read successfully, so a failed read holds that subsystem's state and
+    // the next success diffs over the true elapsed span.
+    prev_stats_at: Option<Instant>,
+    prev_ifstats_at: Option<Instant>,
+    prev_nvlink_at: Option<Instant>,
+    prev_xgmi_at: Option<Instant>,
+    prev_taken_at: Option<Instant>,
+    rdma_rows: Vec<PortThroughput>,
+    nvlink_rows: Vec<PortThroughput>,
+    xgmi_rows: Vec<PortThroughput>,
+    net_rate: NetRate,
+    pub has_data: bool,
+    /// Panic message from a dead sampler thread; None while it is alive.
+    pub sampler_error: Option<String>,
     pub rolling_avg: RollingAvgState,
     pub show_rolling_avg: bool,
     pub show_window_input: bool,
@@ -420,8 +435,6 @@ pub struct SysInfo {
 
 impl App {
     pub fn new() -> Self {
-        let stats = stat::read_all_stats().unwrap_or_default();
-        let ifstats = net::read_all_ifstats().unwrap_or_default();
         Self {
             should_quit: false,
             throughputs: Vec::new(),
@@ -435,9 +448,19 @@ impl App {
             sysinfo: read_sysinfo(NetRate::default()),
             history: HashMap::new(),
             cpu_history: Vec::with_capacity(HISTORY_LEN),
-            prev_stats: stats,
-            prev_ifstats: ifstats,
-            prev_time: Instant::now(),
+            prev_stats: Vec::new(),
+            prev_ifstats: Vec::new(),
+            prev_stats_at: None,
+            prev_ifstats_at: None,
+            prev_nvlink_at: None,
+            prev_xgmi_at: None,
+            prev_taken_at: None,
+            rdma_rows: Vec::new(),
+            nvlink_rows: Vec::new(),
+            xgmi_rows: Vec::new(),
+            net_rate: NetRate::default(),
+            has_data: false,
+            sampler_error: None,
             rolling_avg: RollingAvgState::new(ROLLING_AVG_DEFAULT_WINDOW),
             show_rolling_avg: false,
             show_window_input: false,
@@ -452,66 +475,104 @@ impl App {
             cached_display: Vec::new(),
             recorder: None,
             record_status: None,
-            // Pre-read like prev_stats: NVML/amdsmi counters are cumulative
-            // since driver load; an empty baseline causes a first-frame spike.
-            prev_nvlink: crate::nvlink::read_all_nvlink_stats().unwrap_or_default(),
-            prev_xgmi: crate::xgmi::read_all_xgmi_stats().unwrap_or_default(),
+            prev_nvlink: Vec::new(),
+            prev_xgmi: Vec::new(),
             active_tab: DeviceClass::Rdma,
             seen_tabs: vec![DeviceClass::Rdma],
             tab_selection: HashMap::new(),
         }
     }
 
-    pub fn refresh_stats(&mut self) {
-        let curr = match stat::read_all_stats() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let elapsed = self.prev_time.elapsed().as_secs_f64();
-        if elapsed < 0.1 {
-            return;
+    /// Fold one sampler snapshot into the app state, per subsystem: a failed
+    /// read (None) keeps that subsystem's previous rows and baseline, so one
+    /// broken source never blocks the others. Each subsystem's first success
+    /// is its baseline (prev == curr, zero rates); real rates follow. Elapsed
+    /// comes from sampler-side timestamps so UI queue latency can't skew rates.
+    pub fn apply_snapshot(&mut self, snap: crate::sampler::Snapshot) {
+        if let Some(prev) = self.prev_taken_at {
+            if snap.taken_at.duration_since(prev).as_secs_f64() < 0.1 {
+                return;
+            }
         }
-        self.throughputs = compute_throughputs(&self.prev_stats, &curr, elapsed);
-        self.prev_stats = curr;
+        // Per-subsystem elapsed: each sample carries its own read-adjacent
+        // timestamp, measured to that subsystem's last success, so neither
+        // another subsystem's latency nor a skipped tick can skew the span.
+        let since =
+            |now: Instant, at: Option<Instant>| at.map(|a| now.duration_since(a).as_secs_f64());
 
-        {
-            let curr_nvlink = crate::nvlink::read_all_nvlink_stats().unwrap_or_default();
-            let mut nvlink_rows =
-                compute_nvlink_throughputs(&self.prev_nvlink, &curr_nvlink, elapsed);
-            self.throughputs.append(&mut nvlink_rows);
-            self.prev_nvlink = curr_nvlink;
+        if let Some(s) = snap.stats {
+            self.rdma_rows = match since(s.taken_at, self.prev_stats_at) {
+                Some(e) => compute_throughputs(&self.prev_stats, &s.data, e),
+                None => compute_throughputs(&s.data, &s.data, 1.0), // baseline
+            };
+            self.prev_stats = s.data;
+            self.prev_stats_at = Some(s.taken_at);
         }
 
-        {
-            let curr_xgmi = crate::xgmi::read_all_xgmi_stats().unwrap_or_default();
-            let mut xgmi_rows = compute_xgmi_throughputs(&self.prev_xgmi, &curr_xgmi, elapsed);
-            self.throughputs.append(&mut xgmi_rows);
-            self.prev_xgmi = curr_xgmi;
+        if let Some(s) = snap.nvlink {
+            self.nvlink_rows = match since(s.taken_at, self.prev_nvlink_at) {
+                Some(e) => compute_nvlink_throughputs(&self.prev_nvlink, &s.data, e),
+                None => compute_nvlink_throughputs(&s.data, &s.data, 1.0), // baseline
+            };
+            self.prev_nvlink = s.data;
+            self.prev_nvlink_at = Some(s.taken_at);
         }
+
+        if let Some(s) = snap.xgmi {
+            self.xgmi_rows = match since(s.taken_at, self.prev_xgmi_at) {
+                Some(e) => compute_xgmi_throughputs(&self.prev_xgmi, &s.data, e),
+                None => compute_xgmi_throughputs(&s.data, &s.data, 1.0), // baseline
+            };
+            self.prev_xgmi = s.data;
+            self.prev_xgmi_at = Some(s.taken_at);
+        }
+
+        if let Some(s) = snap.ifstats {
+            if let Some(e) = since(s.taken_at, self.prev_ifstats_at) {
+                self.net_rate = net::compute_net_rate(&self.prev_ifstats, &s.data, e);
+            }
+            self.prev_ifstats = s.data;
+            self.prev_ifstats_at = Some(s.taken_at);
+        }
+
+        if let Some(processes) = snap.processes {
+            self.processes = processes;
+        }
+
+        self.throughputs = self.rdma_rows.clone();
+        self.throughputs.extend(self.nvlink_rows.iter().cloned());
+        self.throughputs.extend(self.xgmi_rows.iter().cloned());
 
         // Stable display order: sort once here so history, rolling averages,
         // recording, and the display all inherit the same order.
         sort_by_device_order(&mut self.throughputs);
         detect_tabs(&mut self.seen_tabs, &self.throughputs);
 
-        let curr_if = net::read_all_ifstats().unwrap_or_default();
-        let net_rate = net::compute_net_rate(&self.prev_ifstats, &curr_if, elapsed);
-        self.prev_ifstats = curr_if;
+        self.prev_taken_at = Some(snap.taken_at);
+        self.has_data = true;
 
-        self.prev_time = Instant::now();
         self.clamp_selection();
         self.update_history();
-        self.refresh_processes();
         self.rolling_avg.push(&self.throughputs);
         if let Some(rec) = &mut self.recorder {
-            rec.push(port_metrics(&self.throughputs));
+            rec.push(snap.taken_at, port_metrics(&self.throughputs));
         }
-        self.sysinfo = read_sysinfo(net_rate);
+        self.sysinfo = read_sysinfo(self.net_rate.clone());
         if self.cpu_history.len() >= HISTORY_LEN {
             self.cpu_history.remove(0);
         }
         self.cpu_history.push(self.sysinfo.cpu_pct);
         self.recompute_display();
+    }
+
+    /// Seconds since the last applied snapshot when it exceeds a staleness
+    /// threshold (3x the refresh interval, min 2s); `None` while fresh.
+    /// Lets the UI flag a stalled sampler, which `sampler_error` cannot see.
+    pub fn stale_secs(&self) -> Option<u64> {
+        let at = self.prev_taken_at?;
+        let threshold = (self.refresh_interval * 3).max(Duration::from_secs(2));
+        let age = at.elapsed();
+        (age > threshold).then_some(age.as_secs())
     }
 
     /// Recompute the cached display throughputs (call after any change to
@@ -540,12 +601,6 @@ impl App {
                 .entry(t.dev_name.clone())
                 .or_insert_with(DeviceHistory::new)
                 .push(t.tx_gbps, t.rx_gbps);
-        }
-    }
-
-    fn refresh_processes(&mut self) {
-        if let Ok(qps) = stat::read_all_qps() {
-            self.processes = stat::aggregate_by_process(&qps);
         }
     }
 
@@ -2214,5 +2269,152 @@ mod tab_tests {
         app.active_tab = DeviceClass::Rdma;
         app.cycle_tab(true);
         assert_eq!(app.active_tab, DeviceClass::Rdma);
+    }
+}
+
+#[cfg(test)]
+mod apply_snapshot_tests {
+    use super::*;
+    use crate::sampler::Snapshot;
+    use crate::stat::{HwCounter, PortStat};
+
+    fn port_stat(dev: &str, tx_bytes: u64) -> PortStat {
+        PortStat {
+            dev_name: dev.to_string(),
+            port: 1,
+            link_gbps: Some(400.0),
+            counters: vec![HwCounter {
+                name: "tx_bytes".to_string(),
+                value: tx_bytes,
+            }],
+        }
+    }
+
+    fn sample<T>(data: T, taken_at: Instant) -> Option<crate::sampler::Sample<T>> {
+        Some(crate::sampler::Sample { data, taken_at })
+    }
+
+    fn snapshot(stats: Vec<PortStat>, taken_at: Instant) -> Snapshot {
+        Snapshot {
+            stats: sample(stats, taken_at),
+            ifstats: sample(Vec::new(), taken_at),
+            nvlink: sample(Vec::new(), taken_at),
+            xgmi: sample(Vec::new(), taken_at),
+            processes: Some(Vec::new()),
+            taken_at,
+        }
+    }
+
+    fn gpu_snapshot(tx_bytes: u64, taken_at: Instant) -> Snapshot {
+        let gpu = crate::nvlink::NvLinkSnapshot {
+            gpu_index: 0,
+            gpu_name: "test-gpu".to_string(),
+            link_count: 0,
+            link_gbps: None,
+            tx_bytes: Some(tx_bytes),
+            rx_bytes: Some(0),
+            links: Vec::new(),
+        };
+        Snapshot {
+            stats: None, // e.g. kernel without rdma netlink support
+            ifstats: sample(Vec::new(), taken_at),
+            nvlink: sample(vec![gpu], taken_at),
+            xgmi: sample(Vec::new(), taken_at),
+            processes: Some(Vec::new()),
+            taken_at,
+        }
+    }
+
+    #[test]
+    fn rates_use_per_subsystem_read_timestamps() {
+        // A slow pass must not skew a subsystem read later in it: the GPU
+        // sample's own timestamp, not the pass start, drives its elapsed.
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let mut first = gpu_snapshot(0, t0);
+        // First pass was slow: GPU counters actually read 2s after pass start.
+        first.nvlink.as_mut().unwrap().taken_at = t0 + Duration::from_secs(2);
+        app.apply_snapshot(first);
+        // Second pass, fast: read at t0+4s -> true GPU window is 2s, not 4s.
+        app.apply_snapshot(gpu_snapshot(1_000_000_000, t0 + Duration::from_secs(4)));
+        // 1e9 bytes * 8 / 2 s / 1e9 = 4.0 Gbps (2.0 would mean pass-start skew)
+        assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_snapshot_populates_rows_with_zero_rates() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 1_000_000)], t0));
+        assert!(app.has_data);
+        assert_eq!(app.throughputs.len(), 1);
+        assert_eq!(app.throughputs[0].dev_name, "mlx5_0");
+        assert_eq!(app.throughputs[0].tx_gbps, 0.0); // baseline, no delta yet
+    }
+
+    #[test]
+    fn second_snapshot_computes_rates_from_thread_timestamps() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 0)], t0));
+        // +1 GB over exactly 2s (thread timestamps, not wall clock here)
+        let t1 = t0 + Duration::from_secs(2);
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 1_000_000_000)], t1));
+        // 1e9 bytes * 8 bits / 2 s / 1e9 = 4.0 Gbps
+        assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subsecond_duplicate_snapshot_is_skipped() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 0)], t0));
+        app.apply_snapshot(snapshot(
+            vec![port_stat("mlx5_0", 999)],
+            t0 + Duration::from_millis(50),
+        ));
+        // Skipped: rates still the baseline zeros.
+        assert_eq!(app.throughputs[0].tx_gbps, 0.0);
+        // The skipped counters must not have become the new baseline: the
+        // next snapshot diffs against the ORIGINAL t0 baseline (0 bytes).
+        app.apply_snapshot(snapshot(
+            vec![port_stat("mlx5_0", 1_000_000_000)],
+            t0 + Duration::from_secs(2),
+        ));
+        // 1e9 bytes * 8 / 2 s / 1e9 = 4.0 Gbps (4.1 would mean 999 leaked in)
+        assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn failed_rdma_read_holds_rdma_state_only() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 0)], t0));
+        let mut bad = snapshot(Vec::new(), t0 + Duration::from_secs(2));
+        bad.stats = None;
+        app.apply_snapshot(bad);
+        // RDMA rows and baseline are held, not blanked.
+        assert_eq!(app.throughputs.len(), 1);
+        // Next good snapshot diffs against the ORIGINAL baseline: no spike.
+        app.apply_snapshot(snapshot(
+            vec![port_stat("mlx5_0", 1_000_000_000)],
+            t0 + Duration::from_secs(4),
+        ));
+        // 1e9 bytes * 8 / 4 s / 1e9 = 2.0 Gbps
+        assert!((app.throughputs[0].tx_gbps - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gpu_data_flows_when_rdma_read_always_fails() {
+        // A kernel without rdma netlink must still show NVLink data.
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.apply_snapshot(gpu_snapshot(0, t0));
+        assert!(app.has_data);
+        assert_eq!(app.throughputs.len(), 1);
+        assert_eq!(app.throughputs[0].tx_gbps, 0.0); // GPU baseline
+        app.apply_snapshot(gpu_snapshot(1_000_000_000, t0 + Duration::from_secs(2)));
+        // 1e9 bytes * 8 / 2 s / 1e9 = 4.0 Gbps
+        assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
     }
 }
