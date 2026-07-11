@@ -494,43 +494,45 @@ impl App {
                 return;
             }
         }
-        // Per-subsystem elapsed: measured to that subsystem's last success,
-        // so a skipped tick diffs cumulative counters over the true span.
-        let since = |at: Option<Instant>| at.map(|a| snap.taken_at.duration_since(a).as_secs_f64());
+        // Per-subsystem elapsed: each sample carries its own read-adjacent
+        // timestamp, measured to that subsystem's last success, so neither
+        // another subsystem's latency nor a skipped tick can skew the span.
+        let since =
+            |now: Instant, at: Option<Instant>| at.map(|a| now.duration_since(a).as_secs_f64());
 
-        if let Some(stats) = snap.stats {
-            self.rdma_rows = match since(self.prev_stats_at) {
-                Some(e) => compute_throughputs(&self.prev_stats, &stats, e),
-                None => compute_throughputs(&stats, &stats, 1.0), // baseline
+        if let Some(s) = snap.stats {
+            self.rdma_rows = match since(s.taken_at, self.prev_stats_at) {
+                Some(e) => compute_throughputs(&self.prev_stats, &s.data, e),
+                None => compute_throughputs(&s.data, &s.data, 1.0), // baseline
             };
-            self.prev_stats = stats;
-            self.prev_stats_at = Some(snap.taken_at);
+            self.prev_stats = s.data;
+            self.prev_stats_at = Some(s.taken_at);
         }
 
-        if let Some(nvlink) = snap.nvlink {
-            self.nvlink_rows = match since(self.prev_nvlink_at) {
-                Some(e) => compute_nvlink_throughputs(&self.prev_nvlink, &nvlink, e),
-                None => compute_nvlink_throughputs(&nvlink, &nvlink, 1.0), // baseline
+        if let Some(s) = snap.nvlink {
+            self.nvlink_rows = match since(s.taken_at, self.prev_nvlink_at) {
+                Some(e) => compute_nvlink_throughputs(&self.prev_nvlink, &s.data, e),
+                None => compute_nvlink_throughputs(&s.data, &s.data, 1.0), // baseline
             };
-            self.prev_nvlink = nvlink;
-            self.prev_nvlink_at = Some(snap.taken_at);
+            self.prev_nvlink = s.data;
+            self.prev_nvlink_at = Some(s.taken_at);
         }
 
-        if let Some(xgmi) = snap.xgmi {
-            self.xgmi_rows = match since(self.prev_xgmi_at) {
-                Some(e) => compute_xgmi_throughputs(&self.prev_xgmi, &xgmi, e),
-                None => compute_xgmi_throughputs(&xgmi, &xgmi, 1.0), // baseline
+        if let Some(s) = snap.xgmi {
+            self.xgmi_rows = match since(s.taken_at, self.prev_xgmi_at) {
+                Some(e) => compute_xgmi_throughputs(&self.prev_xgmi, &s.data, e),
+                None => compute_xgmi_throughputs(&s.data, &s.data, 1.0), // baseline
             };
-            self.prev_xgmi = xgmi;
-            self.prev_xgmi_at = Some(snap.taken_at);
+            self.prev_xgmi = s.data;
+            self.prev_xgmi_at = Some(s.taken_at);
         }
 
-        if let Some(ifstats) = snap.ifstats {
-            if let Some(e) = since(self.prev_ifstats_at) {
-                self.net_rate = net::compute_net_rate(&self.prev_ifstats, &ifstats, e);
+        if let Some(s) = snap.ifstats {
+            if let Some(e) = since(s.taken_at, self.prev_ifstats_at) {
+                self.net_rate = net::compute_net_rate(&self.prev_ifstats, &s.data, e);
             }
-            self.prev_ifstats = ifstats;
-            self.prev_ifstats_at = Some(snap.taken_at);
+            self.prev_ifstats = s.data;
+            self.prev_ifstats_at = Some(s.taken_at);
         }
 
         if let Some(processes) = snap.processes {
@@ -2288,12 +2290,16 @@ mod apply_snapshot_tests {
         }
     }
 
+    fn sample<T>(data: T, taken_at: Instant) -> Option<crate::sampler::Sample<T>> {
+        Some(crate::sampler::Sample { data, taken_at })
+    }
+
     fn snapshot(stats: Vec<PortStat>, taken_at: Instant) -> Snapshot {
         Snapshot {
-            stats: Some(stats),
-            ifstats: Some(Vec::new()),
-            nvlink: Some(Vec::new()),
-            xgmi: Some(Vec::new()),
+            stats: sample(stats, taken_at),
+            ifstats: sample(Vec::new(), taken_at),
+            nvlink: sample(Vec::new(), taken_at),
+            xgmi: sample(Vec::new(), taken_at),
             processes: Some(Vec::new()),
             taken_at,
         }
@@ -2311,12 +2317,28 @@ mod apply_snapshot_tests {
         };
         Snapshot {
             stats: None, // e.g. kernel without rdma netlink support
-            ifstats: Some(Vec::new()),
-            nvlink: Some(vec![gpu]),
-            xgmi: Some(Vec::new()),
+            ifstats: sample(Vec::new(), taken_at),
+            nvlink: sample(vec![gpu], taken_at),
+            xgmi: sample(Vec::new(), taken_at),
             processes: Some(Vec::new()),
             taken_at,
         }
+    }
+
+    #[test]
+    fn rates_use_per_subsystem_read_timestamps() {
+        // A slow pass must not skew a subsystem read later in it: the GPU
+        // sample's own timestamp, not the pass start, drives its elapsed.
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let mut first = gpu_snapshot(0, t0);
+        // First pass was slow: GPU counters actually read 2s after pass start.
+        first.nvlink.as_mut().unwrap().taken_at = t0 + Duration::from_secs(2);
+        app.apply_snapshot(first);
+        // Second pass, fast: read at t0+4s -> true GPU window is 2s, not 4s.
+        app.apply_snapshot(gpu_snapshot(1_000_000_000, t0 + Duration::from_secs(4)));
+        // 1e9 bytes * 8 / 2 s / 1e9 = 4.0 Gbps (2.0 would mean pass-start skew)
+        assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
     }
 
     #[test]

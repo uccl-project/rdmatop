@@ -8,31 +8,43 @@ use std::time::{Duration, Instant};
 
 use crate::{net, nvlink, stat, xgmi};
 
+/// One subsystem's reading stamped right at its own read, so rate math
+/// never absorbs another subsystem's latency (e.g. a driver init earlier
+/// in the same pass).
+pub struct Sample<T> {
+    pub data: T,
+    pub taken_at: Instant,
+}
+
+fn sample<T>(read: impl FnOnce() -> std::io::Result<T>) -> Option<Sample<T>> {
+    let taken_at = Instant::now();
+    read().ok().map(|data| Sample { data, taken_at })
+}
+
 /// Everything one sampling pass produces. Raw counters only; delta/rate
 /// math stays on the UI thread where the previous snapshot lives.
 /// Each field is None when its read failed, so one failing subsystem
 /// (e.g. a kernel without rdma netlink) never blocks the others.
 pub struct Snapshot {
-    pub stats: Option<Vec<stat::PortStat>>,
-    pub ifstats: Option<Vec<net::IfStats>>,
-    pub nvlink: Option<Vec<nvlink::NvLinkSnapshot>>,
-    pub xgmi: Option<Vec<xgmi::XgmiSnapshot>>,
+    pub stats: Option<Sample<Vec<stat::PortStat>>>,
+    pub ifstats: Option<Sample<Vec<net::IfStats>>>,
+    pub nvlink: Option<Sample<Vec<nvlink::NvLinkSnapshot>>>,
+    pub xgmi: Option<Sample<Vec<xgmi::XgmiSnapshot>>>,
     pub processes: Option<Vec<stat::ProcessRdmaInfo>>,
+    /// Pass start; used for the duplicate guard, staleness, and trace ts.
     pub taken_at: Instant,
 }
 
 fn collect() -> Snapshot {
-    // Stamp before the reads: the UI derives rates from taken_at deltas, so
-    // a slow pass (e.g. first-time driver init) must not inflate elapsed.
     let taken_at = Instant::now();
     let processes = stat::read_all_qps()
         .ok()
         .map(|qps| stat::aggregate_by_process(&qps));
     Snapshot {
-        stats: stat::read_all_stats().ok(),
-        ifstats: net::read_all_ifstats().ok(),
-        nvlink: nvlink::read_all_nvlink_stats().ok(),
-        xgmi: xgmi::read_all_xgmi_stats().ok(),
+        stats: sample(stat::read_all_stats),
+        ifstats: sample(net::read_all_ifstats),
+        nvlink: sample(nvlink::read_all_nvlink_stats),
+        xgmi: sample(xgmi::read_all_xgmi_stats),
         processes,
         taken_at,
     }
