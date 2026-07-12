@@ -2511,9 +2511,10 @@ mod gauge_tests {
 
     #[test]
     fn gpu_col_widths_wide_returns_natural() {
+        const BAR: u16 = crate::tui::app::BAR_WIDTH as u16;
         assert_eq!(
             gpu_col_widths(200),
-            [9, 16, 16, 16, 5, 6, 12, 7, 12, 7, 6, 5]
+            [9, 16, 16, 16, 5, 6, BAR, 7, BAR, 7, 6, 5]
         );
     }
 
