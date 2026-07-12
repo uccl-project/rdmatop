@@ -287,23 +287,27 @@ fn pct_gauge_text(pct: Option<u32>, bar_w: usize) -> String {
 /// `avail >= sum(mins) + gaps`; below that all columns sit at their min
 /// and ratatui clips. See the shave pass for how floor overshoot is paid.
 fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
+    debug_assert_eq!(natural.len(), mins.len());
     if natural.is_empty() {
         return Vec::new();
     }
-    // n-1 inter-column gaps plus one slack cell to absorb min-flooring;
-    // the slack is denominator-only, so naturals need only total - 1.
-    let total: u16 = natural.iter().sum::<u16>() + natural.len() as u16;
-    if avail >= total - 1 {
+    let gaps = natural.len().saturating_sub(1) as u16;
+    let total: u16 = natural.iter().sum::<u16>() + gaps;
+    if avail >= total {
         return natural.to_vec();
     }
+    // Rounded division avoids a systematic downward bias; overshoot from
+    // rounding or min-flooring is paid back by the shave pass below.
     let mut out: Vec<u16> = natural
         .iter()
         .zip(mins)
-        .map(|(&nat, &min)| (((nat as u32 * avail as u32) / total as u32) as u16).max(min))
+        .map(|(&nat, &min)| {
+            let scaled = (nat as u32 * avail as u32 + total as u32 / 2) / total as u32;
+            (scaled as u16).max(min)
+        })
         .collect();
-    // Reclaim min-floor overshoot from columns still above their floor,
-    // largest excess first, so the result fits whenever sum(mins) does.
-    let gaps = natural.len().saturating_sub(1) as u16;
+    // Reclaim overshoot from columns still above their floor, largest
+    // excess first, so the result fits whenever sum(mins) does.
     let mut sum: u16 = out.iter().sum();
     while sum + gaps > avail {
         let Some(i) = (0..out.len())
@@ -322,7 +326,8 @@ fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
 /// (inner table width) by a common fraction, each floored at a minimum
 /// so labels stay legible before ratatui clips whole columns.
 fn gpu_col_widths(avail: u16) -> [u16; 12] {
-    const NATURAL: [u16; 12] = [9, 16, 16, 16, 5, 6, 12, 7, 12, 7, 6, 5];
+    const BAR: u16 = super::app::BAR_WIDTH as u16;
+    const NATURAL: [u16; 12] = [9, 16, 16, 16, 5, 6, BAR, 7, BAR, 7, 6, 5];
     const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
     scaled_col_widths(&NATURAL, &MIN, avail)
         .try_into()
@@ -336,8 +341,10 @@ fn rdma_col_min(col: &TableColumn) -> u16 {
     match col {
         TableColumn::TxBar | TableColumn::RxBar => 6,
         _ => {
+            // 3/5 of natural, floored at 4 cells; capped at natural so a
+            // future column narrower than 4 can't get a min wider than itself.
             let n = col.width();
-            n.min((n * 3 / 5).max(4))
+            (n * 3 / 5).max(4).min(n)
         }
     }
 }
