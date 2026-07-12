@@ -1,3 +1,4 @@
+mod gpu;
 mod net;
 mod netlink;
 mod nvlink;
