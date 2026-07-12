@@ -7,8 +7,7 @@ use ratatui::{
 };
 
 use super::app::{
-    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, BAR_WIDTH,
-    EXTRA_COUNTERS,
+    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, EXTRA_COUNTERS,
 };
 use super::theme::ThemeColors;
 use crate::gpu::GpuMetrics;
@@ -257,11 +256,11 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(tab_bar_line(app, tc)), area);
 }
 
-fn gbps_bar(gbps: f64, link_gbps: Option<f64>) -> String {
+fn gbps_bar(gbps: f64, link_gbps: Option<f64>, width: usize) -> String {
     // Scale to the port's line rate; fall back to a default when unknown.
     let max = link_gbps.filter(|&r| r > 0.0).unwrap_or(RDMA_LINK_GBPS);
     let ratio = (gbps / max).clamp(0.0, 1.0);
-    ratio_bar(ratio, BAR_WIDTH)
+    ratio_bar(ratio, width)
 }
 
 /// Meter string for a 0..=1 ratio, `width` chars, glyph-mode aware.
@@ -275,25 +274,98 @@ fn ratio_bar(ratio: f64, width: usize) -> String {
 }
 
 /// "██████░░░░  87%" gauge text for a 0-100 percent, or "-" when None.
-fn pct_gauge_text(pct: Option<u32>) -> String {
+/// `bar_w` sizes the meter; the trailing " {:>3}%" text is fixed.
+fn pct_gauge_text(pct: Option<u32>, bar_w: usize) -> String {
     match pct {
-        Some(p) => format!("{} {:>3}%", ratio_bar(p as f64 / 100.0, 10), p),
+        Some(p) => format!("{} {:>3}%", ratio_bar(p as f64 / 100.0, bar_w), p),
         None => "-".to_string(),
     }
 }
 
-fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
+/// Scale column widths by a common fraction of their naturals to fit
+/// `avail` (incl. one-cell gaps), flooring each at `mins`. Fits whenever
+/// `avail >= sum(mins) + gaps`; below that all columns sit at their min
+/// and ratatui clips. See the shave pass for how floor overshoot is paid.
+fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
+    debug_assert_eq!(natural.len(), mins.len());
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    let gaps = natural.len().saturating_sub(1) as u16;
+    let total: u16 = natural.iter().sum::<u16>() + gaps;
+    if avail >= total {
+        return natural.to_vec();
+    }
+    // Rounded division avoids a systematic downward bias; overshoot from
+    // rounding or min-flooring is paid back by the shave pass below.
+    let mut out: Vec<u16> = natural
+        .iter()
+        .zip(mins)
+        .map(|(&nat, &min)| {
+            let scaled = (nat as u32 * avail as u32 + total as u32 / 2) / total as u32;
+            (scaled as u16).max(min)
+        })
+        .collect();
+    // Reclaim overshoot from columns still above their floor, largest
+    // excess first, so the result fits whenever sum(mins) does.
+    let mut sum: u16 = out.iter().sum();
+    while sum + gaps > avail {
+        let Some(i) = (0..out.len())
+            .filter(|&i| out[i] > mins[i])
+            .max_by_key(|&i| out[i] - mins[i])
+        else {
+            break; // all at min: avail < sum(mins)+gaps, clipping unavoidable
+        };
+        out[i] -= 1;
+        sum -= 1;
+    }
+    out
+}
+
+/// Natural per-column widths for the GPU table, scaled to fit `avail`
+/// (inner table width) by a common fraction, each floored at a minimum
+/// so labels stay legible before ratatui clips whole columns.
+fn gpu_col_widths(avail: u16) -> [u16; 12] {
+    const BAR: u16 = super::app::BAR_WIDTH as u16;
+    const NATURAL: [u16; 12] = [9, 16, 16, 16, 5, 6, BAR, 7, BAR, 7, 6, 5];
+    const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
+    scaled_col_widths(&NATURAL, &MIN, avail)
+        .try_into()
+        .expect("12 naturals in, 12 widths out")
+}
+
+/// Minimum width a scaled RDMA column may shrink to: bars stay 6 cells
+/// wide so the meter reads; everything else keeps 3/5 of its natural
+/// width (at least 4) so values stay legible.
+fn rdma_col_min(col: &TableColumn) -> u16 {
+    match col {
+        TableColumn::TxBar | TableColumn::RxBar => 6,
+        _ => {
+            // 3/5 of natural, floored at 4 cells; capped at natural so a
+            // future column narrower than 4 can't get a min wider than itself.
+            let n = col.width();
+            (n * 3 / 5).max(4).min(n)
+        }
+    }
+}
+
+fn column_cell(
+    col: &TableColumn,
+    t: &PortThroughput,
+    tc: &ThemeColors,
+    col_w: u16,
+) -> Cell<'static> {
     match col {
         TableColumn::Device => Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
         TableColumn::Port => {
             let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
-        TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps))
+        TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
-        TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps))
+        TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         TableColumn::RxGbps => Cell::from(format!("{:.2}", t.rx_gbps))
             .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
@@ -373,7 +445,7 @@ fn gpu_metrics(t: &PortThroughput) -> Option<&GpuMetrics> {
     nv.or_else(|| t.xgmi.as_ref().and_then(|m| m.metrics.as_ref()))
 }
 
-fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
+fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors, widths: &[u16; 12]) -> Vec<Cell<'static>> {
     let m = gpu_metrics(t);
     let util = m.and_then(|m| m.util_pct);
     let mem = m.and_then(|m| match (m.vram_used_mb, m.vram_total_mb) {
@@ -382,12 +454,14 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
         }
         _ => None,
     });
-    let pct_cell = |p: Option<u32>| {
+    // Gauge bar fills its column minus the fixed " 100%" suffix (5 chars).
+    let pct_cell = |p: Option<u32>, col_w: u16| {
         let color = match p {
             Some(v) => capacity_color(v as f64 / 100.0, tc),
             None => tc.muted,
         };
-        Cell::from(pct_gauge_text(p)).style(Style::default().fg(color))
+        let bar_w = (col_w as usize).saturating_sub(5).max(3);
+        Cell::from(pct_gauge_text(p, bar_w)).style(Style::default().fg(color))
     };
     let temp_cell = match m.and_then(|m| m.temp_c) {
         Some(t) => Cell::from(format!("{}C", t)).style(Style::default().fg(temp_color(t, tc))),
@@ -402,25 +476,19 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
     vec![
         Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
         Cell::from(gpu_meta_name(t)).style(Style::default().fg(tc.muted)),
-        pct_cell(util),
-        pct_cell(mem),
+        pct_cell(util, widths[2]),
+        pct_cell(mem, widths[3]),
         temp_cell,
         pwr_cell,
-        Cell::from(gbps_bar(t.tx_gbps, t.link_gbps)).style(Style::default().fg(throughput_color(
-            t.tx_gbps,
-            t.link_gbps,
-            tc,
-        ))),
+        Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, widths[6] as usize))
+            .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         Cell::from(format!("{:.2}", t.tx_gbps)).style(Style::default().fg(throughput_color(
             t.tx_gbps,
             t.link_gbps,
             tc,
         ))),
-        Cell::from(gbps_bar(t.rx_gbps, t.link_gbps)).style(Style::default().fg(throughput_color(
-            t.rx_gbps,
-            t.link_gbps,
-            tc,
-        ))),
+        Cell::from(gbps_bar(t.rx_gbps, t.link_gbps, widths[8] as usize))
+            .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         Cell::from(format!("{:.2}", t.rx_gbps)).style(Style::default().fg(throughput_color(
             t.rx_gbps,
             t.link_gbps,
@@ -487,29 +555,17 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
     )
     .height(1);
 
+    // Block borders (2) and the "▶ " highlight column (2) shrink what the
+    // Table layout actually distributes among columns; scale to fit that.
+    let avail = area.width.saturating_sub(2 + 2);
+    let widths = gpu_col_widths(avail);
+
     let rows: Vec<Row> = display
         .iter()
-        .map(|t| Row::new(gpu_row_cells(t, tc)))
+        .map(|t| Row::new(gpu_row_cells(t, tc, &widths)))
         .collect();
 
-    // Util/Mem hold a 10-char gauge + " 100%" (15 chars); bars reuse
-    // BAR_WIDTH so the TX/RX meters match the RDMA tab visually.
-    let widths = [
-        Constraint::Length(9),
-        Constraint::Length(16),
-        Constraint::Length(16),
-        Constraint::Length(16),
-        Constraint::Length(5),
-        Constraint::Length(6),
-        Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(7),
-        Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(7),
-        Constraint::Length(6),
-        Constraint::Length(5),
-    ];
-
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, widths.map(Constraint::Length))
         .header(header)
         .block(
             Block::default()
@@ -633,22 +689,28 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     )
     .height(1);
 
+    // Scale the rendered set to fit, like the GPU table. Normal-mode
+    // windowing already fits naturals, so scaling only bites when it
+    // doesn't (detail mode's fixed default set, or a too-narrow pane).
+    let natural: Vec<u16> = cols_to_render.iter().map(|c| c.width()).collect();
+    let mins: Vec<u16> = cols_to_render.iter().map(|c| rdma_col_min(c)).collect();
+    // Block borders (2) and the highlight column (2), as in draw_gpu_table.
+    let col_widths = scaled_col_widths(&natural, &mins, area.width.saturating_sub(2 + 2));
+
     let rows: Vec<Row> = display
         .iter()
         .map(|t| {
             Row::new(
                 cols_to_render
                     .iter()
-                    .map(|c| column_cell(c, t, tc))
+                    .zip(&col_widths)
+                    .map(|(c, &w)| column_cell(c, t, tc, w))
                     .collect::<Vec<_>>(),
             )
         })
         .collect();
 
-    let widths: Vec<Constraint> = cols_to_render
-        .iter()
-        .map(|c| Constraint::Length(c.width()))
-        .collect();
+    let widths: Vec<Constraint> = col_widths.iter().map(|&w| Constraint::Length(w)).collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -2436,7 +2498,7 @@ mod gauge_tests {
 
     #[test]
     fn pct_gauge_text_formats_percent_with_bar() {
-        let text = pct_gauge_text(Some(87));
+        let text = pct_gauge_text(Some(87), 10);
         assert!(text.contains("87%"), "{text:?}");
         let (fill, _) = crate::tui::glyphs::meter();
         assert!(text.contains(fill), "expected bar glyph in {text:?}");
@@ -2444,6 +2506,46 @@ mod gauge_tests {
 
     #[test]
     fn pct_gauge_text_none_is_dash() {
-        assert_eq!(pct_gauge_text(None), "-");
+        assert_eq!(pct_gauge_text(None, 10), "-");
+    }
+
+    #[test]
+    fn gpu_col_widths_wide_returns_natural() {
+        const BAR: u16 = crate::tui::app::BAR_WIDTH as u16;
+        assert_eq!(
+            gpu_col_widths(200),
+            [9, 16, 16, 16, 5, 6, BAR, 7, BAR, 7, 6, 5]
+        );
+    }
+
+    #[test]
+    fn gpu_col_widths_narrow_fits_avail_and_respects_minimums() {
+        const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
+        let widths = gpu_col_widths(100);
+        let total: u16 = widths.iter().sum::<u16>() + 11; // 11 column gaps
+        assert!(total <= 100, "scaled widths too wide: {total}");
+        for (i, (&w, &min)) in widths.iter().zip(MIN.iter()).enumerate() {
+            assert!(w >= min, "col {i}: width {w} below min {min}");
+        }
+    }
+
+    #[test]
+    fn gpu_col_widths_below_min_floor_pins_every_column_at_min() {
+        const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
+        // sum(MIN) + 11 gaps = 85 > 80: nothing left to shave, all at min.
+        assert_eq!(gpu_col_widths(80), MIN);
+    }
+
+    #[test]
+    fn scaled_col_widths_naturals_when_wide_fits_when_narrow() {
+        let natural = [10u16, 20, 6];
+        let mins = [4u16, 8, 3];
+        assert_eq!(scaled_col_widths(&natural, &mins, 100), natural);
+        let scaled = scaled_col_widths(&natural, &mins, 24);
+        let total: u16 = scaled.iter().sum::<u16>() + 2; // 2 column gaps
+        assert!(total <= 24, "scaled widths too wide: {total}");
+        for (i, (&w, &min)) in scaled.iter().zip(mins.iter()).enumerate() {
+            assert!(w >= min, "col {i}: width {w} below min {min}");
+        }
     }
 }
