@@ -7,8 +7,7 @@ use ratatui::{
 };
 
 use super::app::{
-    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, BAR_WIDTH,
-    EXTRA_COUNTERS,
+    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, EXTRA_COUNTERS,
 };
 use super::theme::ThemeColors;
 use crate::gpu::GpuMetrics;
@@ -283,38 +282,66 @@ fn pct_gauge_text(pct: Option<u32>, bar_w: usize) -> String {
     }
 }
 
+/// Scale column widths by a common fraction of their naturals to fit
+/// `avail` (incl. one-cell gaps), flooring each at `mins`.
+fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    // n-1 inter-column gaps plus one slack cell to absorb min-flooring;
+    // the slack is denominator-only, so naturals need only total - 1.
+    let total: u16 = natural.iter().sum::<u16>() + natural.len() as u16;
+    if avail >= total - 1 {
+        return natural.to_vec();
+    }
+    natural
+        .iter()
+        .zip(mins)
+        .map(|(&nat, &min)| (((nat as u32 * avail as u32) / total as u32) as u16).max(min))
+        .collect()
+}
+
 /// Natural per-column widths for the GPU table, scaled to fit `avail`
 /// (inner table width) by a common fraction, each floored at a minimum
 /// so labels stay legible before ratatui clips whole columns.
 fn gpu_col_widths(avail: u16) -> [u16; 12] {
     const NATURAL: [u16; 12] = [9, 16, 16, 16, 5, 6, 12, 7, 12, 7, 6, 5];
     const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
-    // 11 inter-column gaps plus one slack cell to absorb min-flooring.
-    let total: u16 = NATURAL.iter().sum::<u16>() + 12;
-    // NATURAL itself only needs sum + 11 gaps; total's slack is denominator-only.
-    if avail >= total - 1 {
-        return NATURAL;
-    }
-    let mut out = [0u16; 12];
-    for i in 0..12 {
-        out[i] = ((NATURAL[i] as u32 * avail as u32) / total as u32) as u16;
-        out[i] = out[i].max(MIN[i]);
-    }
-    out
+    scaled_col_widths(&NATURAL, &MIN, avail)
+        .try_into()
+        .expect("12 naturals in, 12 widths out")
 }
 
-fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
+/// Minimum width a scaled RDMA column may shrink to: bars stay 6 cells
+/// wide so the meter reads; everything else keeps 3/5 of its natural
+/// width (at least 4) so values stay legible.
+fn rdma_col_min(col: &TableColumn) -> u16 {
+    match col {
+        TableColumn::TxBar | TableColumn::RxBar => 6,
+        _ => {
+            let n = col.width();
+            n.min((n * 3 / 5).max(4))
+        }
+    }
+}
+
+fn column_cell(
+    col: &TableColumn,
+    t: &PortThroughput,
+    tc: &ThemeColors,
+    col_w: u16,
+) -> Cell<'static> {
     match col {
         TableColumn::Device => Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
         TableColumn::Port => {
             let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
-        TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, BAR_WIDTH))
+        TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
-        TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps, BAR_WIDTH))
+        TableColumn::RxBar => Cell::from(gbps_bar(t.rx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         TableColumn::RxGbps => Cell::from(format!("{:.2}", t.rx_gbps))
             .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
@@ -638,22 +665,28 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     )
     .height(1);
 
+    // Scale the rendered set to fit, like the GPU table. Normal-mode
+    // windowing already fits naturals, so scaling only bites when it
+    // doesn't (detail mode's fixed default set, or a too-narrow pane).
+    let natural: Vec<u16> = cols_to_render.iter().map(|c| c.width()).collect();
+    let mins: Vec<u16> = cols_to_render.iter().map(|c| rdma_col_min(c)).collect();
+    // Block borders (2) and the highlight column (2), as in draw_gpu_table.
+    let col_widths = scaled_col_widths(&natural, &mins, area.width.saturating_sub(2 + 2));
+
     let rows: Vec<Row> = display
         .iter()
         .map(|t| {
             Row::new(
                 cols_to_render
                     .iter()
-                    .map(|c| column_cell(c, t, tc))
+                    .zip(&col_widths)
+                    .map(|(c, &w)| column_cell(c, t, tc, w))
                     .collect::<Vec<_>>(),
             )
         })
         .collect();
 
-    let widths: Vec<Constraint> = cols_to_render
-        .iter()
-        .map(|c| Constraint::Length(c.width()))
-        .collect();
+    let widths: Vec<Constraint> = col_widths.iter().map(|&w| Constraint::Length(w)).collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -2467,6 +2500,19 @@ mod gauge_tests {
         let total: u16 = widths.iter().sum::<u16>() + 11; // 11 column gaps
         assert!(total <= 90, "scaled widths too wide: {total}");
         for (i, (&w, &min)) in widths.iter().zip(MIN.iter()).enumerate() {
+            assert!(w >= min, "col {i}: width {w} below min {min}");
+        }
+    }
+
+    #[test]
+    fn scaled_col_widths_naturals_when_wide_fits_when_narrow() {
+        let natural = [10u16, 20, 6];
+        let mins = [4u16, 8, 3];
+        assert_eq!(scaled_col_widths(&natural, &mins, 100), natural);
+        let scaled = scaled_col_widths(&natural, &mins, 24);
+        let total: u16 = scaled.iter().sum::<u16>() + 2; // 2 column gaps
+        assert!(total <= 24, "scaled widths too wide: {total}");
+        for (i, (&w, &min)) in scaled.iter().zip(mins.iter()).enumerate() {
             assert!(w >= min, "col {i}: width {w} below min {min}");
         }
     }
