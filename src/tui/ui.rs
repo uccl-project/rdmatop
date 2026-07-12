@@ -274,53 +274,12 @@ fn ratio_bar(ratio: f64, width: usize) -> String {
     bar
 }
 
-/// One " GPUs " panel line: name + util/mem gauges + temp/power/clock.
-fn gpu_gauge_line(dev: &str, name: &str, m: &GpuMetrics, tc: &ThemeColors) -> Line<'static> {
-    const GAUGE_W: usize = 16;
-    let mut spans = vec![styled(
-        &format!(" {:<8} {:<16} ", dev, truncate(name, 16)),
-        tc.fg,
-        false,
-    )];
-    match m.util_pct {
-        Some(u) => {
-            let r = u as f64 / 100.0;
-            spans.push(styled("Util[", tc.muted, false));
-            spans.push(styled(&ratio_bar(r, GAUGE_W), capacity_color(r, tc), false));
-            spans.push(styled(
-                &format!(" {:>3}%] ", u),
-                capacity_color(r, tc),
-                false,
-            ));
-        }
-        None => spans.push(styled("Util[ - ] ", tc.muted, false)),
+/// "██████░░░░  87%" gauge text for a 0-100 percent, or "-" when None.
+fn pct_gauge_text(pct: Option<u32>) -> String {
+    match pct {
+        Some(p) => format!("{} {:>3}%", ratio_bar(p as f64 / 100.0, 10), p),
+        None => "-".to_string(),
     }
-    match (m.vram_used_mb, m.vram_total_mb) {
-        (Some(u), Some(t)) if t > 0 => {
-            let r = u as f64 / t as f64;
-            spans.push(styled("Mem[", tc.muted, false));
-            spans.push(styled(&ratio_bar(r, GAUGE_W), capacity_color(r, tc), false));
-            spans.push(styled(
-                &format!(" {:.1}/{:.1}G] ", u as f64 / 1024.0, t as f64 / 1024.0),
-                capacity_color(r, tc),
-                false,
-            ));
-        }
-        _ => spans.push(styled("Mem[ - ] ", tc.muted, false)),
-    }
-    match m.temp_c {
-        Some(t) => spans.push(styled(&format!("{}C ", t), temp_color(t, tc), false)),
-        None => spans.push(styled("-C ", tc.muted, false)),
-    }
-    spans.push(match m.power_w {
-        Some(p) => styled(&format!("{:.0}W ", p), tc.fg, false),
-        None => styled("-W ", tc.muted, false),
-    });
-    spans.push(match m.clock_mhz {
-        Some(c) => styled(&format!("{}MHz", c), tc.fg, false),
-        None => styled("-MHz", tc.muted, false),
-    });
-    Line::from(spans)
 }
 
 fn column_cell(col: &TableColumn, t: &PortThroughput, tc: &ThemeColors) -> Cell<'static> {
@@ -408,18 +367,45 @@ fn gpu_errs(t: &PortThroughput) -> String {
     sum.to_string()
 }
 
+/// Health metrics from whichever GPU meta the row carries.
+fn gpu_metrics(t: &PortThroughput) -> Option<&GpuMetrics> {
+    let nv = t.nvlink.as_ref().and_then(|m| m.metrics.as_ref());
+    nv.or_else(|| t.xgmi.as_ref().and_then(|m| m.metrics.as_ref()))
+}
+
 fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
-    let speed = t
-        .link_gbps
-        .map(|g| format!("{:.0}", g))
-        .unwrap_or_else(|| "-".to_string());
+    let m = gpu_metrics(t);
+    let util = m.and_then(|m| m.util_pct);
+    let mem = m.and_then(|m| match (m.vram_used_mb, m.vram_total_mb) {
+        (Some(used), Some(total)) if total > 0 => {
+            Some((used as f64 / total as f64 * 100.0).round() as u32)
+        }
+        _ => None,
+    });
+    let pct_cell = |p: Option<u32>| {
+        let color = match p {
+            Some(v) => capacity_color(v as f64 / 100.0, tc),
+            None => tc.muted,
+        };
+        Cell::from(pct_gauge_text(p)).style(Style::default().fg(color))
+    };
+    let temp_cell = match m.and_then(|m| m.temp_c) {
+        Some(t) => Cell::from(format!("{}C", t)).style(Style::default().fg(temp_color(t, tc))),
+        None => Cell::from("-").style(Style::default().fg(tc.muted)),
+    };
+    let pwr_cell = match m.and_then(|m| m.power_w) {
+        Some(p) => Cell::from(format!("{:.0}W", p)).style(Style::default().fg(tc.fg)),
+        None => Cell::from("-").style(Style::default().fg(tc.muted)),
+    };
     // Bar and Gbps live in separate cells styled with gbps_color, exactly
     // like the RDMA table, so the two tabs stay visually aligned.
     vec![
         Cell::from(t.dev_name.clone()).style(Style::default().fg(tc.fg)),
         Cell::from(gpu_meta_name(t)).style(Style::default().fg(tc.muted)),
-        Cell::from(t.port_label.clone().unwrap_or_default()).style(Style::default().fg(tc.fg)),
-        Cell::from(speed).style(Style::default().fg(tc.fg)),
+        pct_cell(util),
+        pct_cell(mem),
+        temp_cell,
+        pwr_cell,
         Cell::from(gbps_bar(t.tx_gbps, t.link_gbps)).style(Style::default().fg(throughput_color(
             t.tx_gbps,
             t.link_gbps,
@@ -440,6 +426,7 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors) -> Vec<Cell<'static>> {
             t.link_gbps,
             tc,
         ))),
+        Cell::from(t.port_label.clone().unwrap_or_default()).style(Style::default().fg(tc.fg)),
         Cell::from(gpu_errs(t)).style(Style::default().fg(tc.warning)),
     ]
 }
@@ -490,38 +477,8 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
         return;
     }
 
-    // Gauge strip above the table when any GPU reported health metrics.
-    let gauges: Vec<Line> = display
-        .iter()
-        .filter_map(|t| {
-            let (name, m) = match (&t.nvlink, &t.xgmi) {
-                (Some(nv), _) => (nv.gpu_name.as_str(), nv.metrics.as_ref()?),
-                (_, Some(xg)) => (xg.gpu_name.as_str(), xg.metrics.as_ref()?),
-                _ => return None,
-            };
-            Some(gpu_gauge_line(&t.dev_name, name, m, tc))
-        })
-        .collect();
-    let mut area = area;
-    if !gauges.is_empty() {
-        // Leave the link table at least 8 rows.
-        let strip_h = (gauges.len() as u16 + 2).min(area.height.saturating_sub(8));
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(strip_h), Constraint::Min(0)])
-            .split(area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_set(super::glyphs::border())
-            .border_style(Style::default().fg(tc.border))
-            .title(" GPUs ")
-            .title_style(Style::default().fg(tc.accent));
-        frame.render_widget(Paragraph::new(gauges).block(block), chunks[0]);
-        area = chunks[1];
-    }
-
     let header = Row::new(vec![
-        "Device", "Name", "Links", "Speed", "TX", "Gbps", "RX", "Gbps", "Errs",
+        "Device", "Name", "Util", "Mem", "Temp", "Pwr", "TX", "Gbps", "RX", "Gbps", "Links", "Errs",
     ])
     .style(
         Style::default()
@@ -535,18 +492,21 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
         .map(|t| Row::new(gpu_row_cells(t, tc)))
         .collect();
 
-    // Shared columns copy the RDMA table's widths (Device 16, bars
-    // BAR_WIDTH, Gbps 9) so switching tabs doesn't shift the layout.
+    // Util/Mem hold a 10-char gauge + " 100%" (15 chars); bars reuse
+    // BAR_WIDTH so the TX/RX meters match the RDMA tab visually.
     let widths = [
+        Constraint::Length(9),
         Constraint::Length(16),
-        Constraint::Length(22),
+        Constraint::Length(16),
+        Constraint::Length(16),
+        Constraint::Length(5),
         Constraint::Length(6),
+        Constraint::Length(BAR_WIDTH as u16),
         Constraint::Length(7),
         Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(9),
-        Constraint::Length(BAR_WIDTH as u16),
-        Constraint::Length(9),
-        Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -811,11 +771,17 @@ fn append_gpu_health(
             ]));
         }
     }
+    let mem = match (m.vram_used_mb, m.vram_total_mb) {
+        (Some(u), Some(t)) if t > 0 => {
+            format!("{:.1}/{:.1}G", u as f64 / 1024.0, t as f64 / 1024.0)
+        }
+        _ => "-".to_string(),
+    };
     let temp = m.temp_c.map_or("-".to_string(), |t| format!("{}C", t));
     let pwr = m.power_w.map_or("-".to_string(), |p| format!("{:.0}W", p));
     let clk = m.clock_mhz.map_or("-".to_string(), |c| format!("{}MHz", c));
     lines.push(Line::from(styled(
-        &format!(" Temp {}  Pwr {}  Clk {}", temp, pwr, clk),
+        &format!(" Mem {}  Temp {}  Pwr {}  Clk {}", mem, temp, pwr, clk),
         tc.fg,
         false,
     )));
@@ -2467,33 +2433,17 @@ mod color_tests {
 #[cfg(test)]
 mod gauge_tests {
     use super::*;
-    use crate::gpu::GpuMetrics;
-    use crate::tui::theme::Theme;
 
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    #[test]
+    fn pct_gauge_text_formats_percent_with_bar() {
+        let text = pct_gauge_text(Some(87));
+        assert!(text.contains("87%"), "{text:?}");
+        let (fill, _) = crate::tui::glyphs::meter();
+        assert!(text.contains(fill), "expected bar glyph in {text:?}");
     }
 
     #[test]
-    fn gauge_line_formats_metrics_and_dashes_missing() {
-        let tc = Theme::Default.colors();
-        let m = GpuMetrics {
-            util_pct: Some(87),
-            vram_used_mb: Some(69_837),
-            vram_total_mb: Some(81_920),
-            temp_c: Some(72),
-            power_w: Some(540.0),
-            clock_mhz: None,
-        };
-        let text = line_text(&gpu_gauge_line("nvidia0", "NVIDIA GB10", &m, &tc));
-        assert!(text.contains("nvidia0"), "{text:?}");
-        assert!(text.contains("87%"), "{text:?}");
-        assert!(text.contains("68.2/80.0G"), "{text:?}");
-        assert!(text.contains("72C"), "{text:?}");
-        assert!(text.contains("540W"), "{text:?}");
-        assert!(
-            text.contains("-MHz"),
-            "missing clock renders '-MHz': {text:?}"
-        );
+    fn pct_gauge_text_none_is_dash() {
+        assert_eq!(pct_gauge_text(None), "-");
     }
 }
