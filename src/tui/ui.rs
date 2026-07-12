@@ -283,7 +283,9 @@ fn pct_gauge_text(pct: Option<u32>, bar_w: usize) -> String {
 }
 
 /// Scale column widths by a common fraction of their naturals to fit
-/// `avail` (incl. one-cell gaps), flooring each at `mins`.
+/// `avail` (incl. one-cell gaps), flooring each at `mins`. Fits whenever
+/// `avail >= sum(mins) + gaps`; below that all columns sit at their min
+/// and ratatui clips. See the shave pass for how floor overshoot is paid.
 fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
     if natural.is_empty() {
         return Vec::new();
@@ -294,11 +296,26 @@ fn scaled_col_widths(natural: &[u16], mins: &[u16], avail: u16) -> Vec<u16> {
     if avail >= total - 1 {
         return natural.to_vec();
     }
-    natural
+    let mut out: Vec<u16> = natural
         .iter()
         .zip(mins)
         .map(|(&nat, &min)| (((nat as u32 * avail as u32) / total as u32) as u16).max(min))
-        .collect()
+        .collect();
+    // Reclaim min-floor overshoot from columns still above their floor,
+    // largest excess first, so the result fits whenever sum(mins) does.
+    let gaps = natural.len().saturating_sub(1) as u16;
+    let mut sum: u16 = out.iter().sum();
+    while sum + gaps > avail {
+        let Some(i) = (0..out.len())
+            .filter(|&i| out[i] > mins[i])
+            .max_by_key(|&i| out[i] - mins[i])
+        else {
+            break; // all at min: avail < sum(mins)+gaps, clipping unavoidable
+        };
+        out[i] -= 1;
+        sum -= 1;
+    }
+    out
 }
 
 /// Natural per-column widths for the GPU table, scaled to fit `avail`
@@ -2494,14 +2511,21 @@ mod gauge_tests {
     }
 
     #[test]
-    fn gpu_col_widths_narrow_scales_above_minimums() {
+    fn gpu_col_widths_narrow_fits_avail_and_respects_minimums() {
         const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
-        let widths = gpu_col_widths(80);
+        let widths = gpu_col_widths(100);
         let total: u16 = widths.iter().sum::<u16>() + 11; // 11 column gaps
-        assert!(total <= 90, "scaled widths too wide: {total}");
+        assert!(total <= 100, "scaled widths too wide: {total}");
         for (i, (&w, &min)) in widths.iter().zip(MIN.iter()).enumerate() {
             assert!(w >= min, "col {i}: width {w} below min {min}");
         }
+    }
+
+    #[test]
+    fn gpu_col_widths_below_min_floor_pins_every_column_at_min() {
+        const MIN: [u16; 12] = [7, 8, 9, 9, 4, 4, 6, 6, 6, 6, 5, 4];
+        // sum(MIN) + 11 gaps = 85 > 80: nothing left to shave, all at min.
+        assert_eq!(gpu_col_widths(80), MIN);
     }
 
     #[test]
