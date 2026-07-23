@@ -143,7 +143,7 @@ impl TableColumn {
         match self {
             Self::Device => 16,
             Self::Port => 6,
-            Self::State => 8,
+            Self::State => 5,
             Self::TxBar | Self::RxBar => BAR_WIDTH as u16,
             Self::TxGbps | Self::RxGbps => 9,
             Self::TxPps | Self::RxPps => 10,

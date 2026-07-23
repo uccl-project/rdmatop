@@ -361,10 +361,8 @@ fn column_cell(
             let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
-        TableColumn::State => {
-            let s = t.state.clone().unwrap_or_else(|| "-".into());
-            Cell::from(s).style(Style::default().fg(state_color(t.state.as_deref(), tc)))
-        }
+        TableColumn::State => Cell::from(state_label(t.state.as_deref()))
+            .style(Style::default().fg(state_color(t.state.as_deref(), tc))),
         TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
@@ -1130,10 +1128,13 @@ fn build_device_header(
     } else {
         String::new()
     };
+    let state = t.state.as_deref();
+    let state_text = format!("  {} {}", state_label(state), state.unwrap_or("-"));
     vec![
         Line::from(vec![
             styled(" Device: ", tc.muted, false),
             styled(&format!("{}/{}", t.dev_name, t.port), tc.accent, true),
+            styled(&state_text, state_color(state, tc), false),
             styled(&mode_label, tc.accent, false),
         ]),
         Line::from(vec![
@@ -1579,11 +1580,21 @@ fn capacity_color(ratio: f64, tc: &ThemeColors) -> ratatui::style::Color {
 
 /// Color a throughput by % of link capacity; unknown capacity falls back
 /// to the absolute-Gbps rule so ports without a rate don't regress.
-/// Green for ACTIVE, red for DOWN, muted for anything else/unknown.
+/// Port status as a single colored dot; the color carries the state and the
+/// full word ("ACTIVE"/"DOWN"/...) is shown in the detail view.
+fn state_label(state: Option<&str>) -> String {
+    match state {
+        Some(_) => if super::glyphs::unicode() { "●" } else { "*" }.into(),
+        None => "-".into(),
+    }
+}
+
+/// Green for active, red for down, yellow for transient states, muted if unknown.
 fn state_color(state: Option<&str>, tc: &ThemeColors) -> ratatui::style::Color {
     match state {
-        Some("ACTIVE") => tc.good,
+        Some("ACTIVE") | Some("ACTIVE_DEFER") => tc.good,
         Some("DOWN") => tc.error,
+        Some("INIT") | Some("ARMED") => tc.warning,
         _ => tc.muted,
     }
 }
