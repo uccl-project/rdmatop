@@ -16,6 +16,8 @@ pub struct PortStat {
     pub port: u32,
     /// Port line rate in Gbps (from sysfs `rate`), None if unavailable.
     pub link_gbps: Option<f64>,
+    /// Logical port state ("ACTIVE", "DOWN", "INIT", ...), None if unavailable.
+    pub state: Option<String>,
     pub counters: Vec<HwCounter>,
 }
 
@@ -70,6 +72,7 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
         dev_name: String::new(),
         port: 0,
         link_gbps: None,
+        state: None,
         counters: Vec::new(),
     };
     for nla in nlmsg.attrs() {
@@ -92,6 +95,49 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
     fill_missing_from_sysfs(&mut stat);
     stat.link_gbps = read_port_link_gbps(&stat.dev_name, stat.port);
     Some(stat)
+}
+
+/// Map the IB port state enum (ib_verbs.h `ib_port_state`) to its name.
+fn port_state_name(v: u8) -> Option<String> {
+    let s = match v {
+        1 => "DOWN",
+        2 => "INIT",
+        3 => "ARMED",
+        4 => "ACTIVE",
+        5 => "ACTIVE_DEFER",
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
+/// Parse the logical port state from sysfs, e.g. "4: ACTIVE" -> "ACTIVE".
+fn read_port_state_sysfs(dev_name: &str, port: u32) -> Option<String> {
+    let path = format!("/sys/class/infiniband/{}/ports/{}/state", dev_name, port);
+    let raw = std::fs::read_to_string(path).ok()?;
+    Some(raw.trim().rsplit(": ").next()?.to_string())
+}
+
+fn parse_port_state(nlmsg: &NlMsg) -> Option<String> {
+    nlmsg
+        .attrs()
+        .find(|nla| nla.attr_type == RDMA_NLDEV_ATTR_PORT_STATE)
+        .and_then(|nla| port_state_name(nla.u8()))
+}
+
+/// Port state from RDMA netlink, falling back to sysfs.
+fn query_port_state(sock: &NlSocket, dev: &RdmaDev, port: u32, seq: u32) -> Option<String> {
+    let msg = NlMsgBuilder::new(
+        rdma_nl_get_type(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_PORT_GET),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+    )
+    .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, dev.idx)
+    .put_u32(RDMA_NLDEV_ATTR_PORT_INDEX, port)
+    .build();
+    collect_responses(sock, msg, parse_port_state)
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .or_else(|| read_port_state_sysfs(&dev.name, port))
 }
 
 /// Parse the port line rate from sysfs, e.g. "400 Gb/sec (4X NDR)" -> 400.0.
@@ -246,7 +292,12 @@ pub fn read_all_stats() -> io::Result<Vec<PortStat>> {
     let mut seq = 100u32;
     for dev in &devs {
         for port in 1..=dev.num_ports {
-            all.extend(query_port_stats(&sock, dev.idx, port, seq)?);
+            let state = query_port_state(&sock, dev, port, seq);
+            seq += 1;
+            for mut stat in query_port_stats(&sock, dev.idx, port, seq)? {
+                stat.state = state.clone();
+                all.push(stat);
+            }
             seq += 1;
         }
     }

@@ -19,6 +19,10 @@ pub struct Nla<'a> {
 }
 
 impl<'a> Nla<'a> {
+    pub fn u8(&self) -> u8 {
+        self.data.first().copied().unwrap_or(0)
+    }
+
     pub fn u32(&self) -> u32 {
         if self.data.len() < 4 {
             return 0;

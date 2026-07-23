@@ -361,6 +361,8 @@ fn column_cell(
             let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
+        TableColumn::State => Cell::from(state_label(t.state.as_deref()))
+            .style(Style::default().fg(state_color(t.state.as_deref(), tc))),
         TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
@@ -1126,10 +1128,13 @@ fn build_device_header(
     } else {
         String::new()
     };
+    let state = t.state.as_deref();
+    let state_text = format!("  {} {}", state_label(state), state.unwrap_or("-"));
     vec![
         Line::from(vec![
             styled(" Device: ", tc.muted, false),
             styled(&format!("{}/{}", t.dev_name, t.port), tc.accent, true),
+            styled(&state_text, state_color(state, tc), false),
             styled(&mode_label, tc.accent, false),
         ]),
         Line::from(vec![
@@ -1575,6 +1580,25 @@ fn capacity_color(ratio: f64, tc: &ThemeColors) -> ratatui::style::Color {
 
 /// Color a throughput by % of link capacity; unknown capacity falls back
 /// to the absolute-Gbps rule so ports without a rate don't regress.
+/// Port status as a single colored dot; the color carries the state and the
+/// full word ("ACTIVE"/"DOWN"/...) is shown in the detail view.
+fn state_label(state: Option<&str>) -> String {
+    match state {
+        Some(_) => if super::glyphs::unicode() { "●" } else { "*" }.into(),
+        None => "-".into(),
+    }
+}
+
+/// Green for active, red for down, yellow for transient states, muted if unknown.
+fn state_color(state: Option<&str>, tc: &ThemeColors) -> ratatui::style::Color {
+    match state {
+        Some("ACTIVE") | Some("ACTIVE_DEFER") => tc.good,
+        Some("DOWN") => tc.error,
+        Some("INIT") | Some("ARMED") => tc.warning,
+        _ => tc.muted,
+    }
+}
+
 fn throughput_color(gbps: f64, link_gbps: Option<f64>, tc: &ThemeColors) -> ratatui::style::Color {
     match link_gbps.filter(|&c| c > 0.0) {
         Some(cap) => capacity_color(gbps / cap, tc),
@@ -1746,6 +1770,7 @@ mod nvlink_detail_tests {
             dev_name: dev_name.to_string(),
             port: active,
             link_gbps: Some(50.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2037,6 +2062,7 @@ mod nvlink_detail_tests {
             dev_name: "nvidia0".to_string(),
             port: 2,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 1.0,
             tx_pkts_per_sec: 0.0,
@@ -2147,6 +2173,7 @@ mod nvlink_detail_tests {
             dev_name: "nvidia0".to_string(),
             port: 2,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 1.0,
             tx_pkts_per_sec: 0.0,
@@ -2230,6 +2257,7 @@ mod xgmi_detail_tests {
             dev_name: "amdgpu0".to_string(),
             port: active,
             link_gbps: Some(512.0 * active as f64),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 2.0,
             tx_pkts_per_sec: 0.0,
@@ -2347,6 +2375,7 @@ mod gpu_table_tests {
             dev_name: "amdgpu0".to_string(),
             port: 7,
             link_gbps: Some(3584.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2374,6 +2403,7 @@ mod gpu_table_tests {
             dev_name: "nvidia0".to_string(),
             port: 18,
             link_gbps: Some(900.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2401,6 +2431,7 @@ mod gpu_table_tests {
             dev_name: "mlx5_0".to_string(),
             port: 1,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
