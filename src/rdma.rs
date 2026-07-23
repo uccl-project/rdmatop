@@ -13,6 +13,7 @@ pub const fn rdma_nl_get_type(client: u32, op: u32) -> u16 {
 
 // Commands
 pub const RDMA_NLDEV_CMD_GET: u32 = 1;
+pub const RDMA_NLDEV_CMD_PORT_GET: u32 = 5;
 pub const RDMA_NLDEV_CMD_RES_QP_GET: u32 = 10;
 pub const RDMA_NLDEV_CMD_STAT_GET: u32 = 17;
 
@@ -20,6 +21,7 @@ pub const RDMA_NLDEV_CMD_STAT_GET: u32 = 17;
 pub const RDMA_NLDEV_ATTR_DEV_INDEX: u16 = 1;
 pub const RDMA_NLDEV_ATTR_DEV_NAME: u16 = 2;
 pub const RDMA_NLDEV_ATTR_PORT_INDEX: u16 = 3;
+pub const RDMA_NLDEV_ATTR_PORT_STATE: u16 = 16;
 pub const RDMA_NLDEV_ATTR_RES_QP: u16 = 19;
 pub const RDMA_NLDEV_ATTR_RES_QP_ENTRY: u16 = 20;
 pub const RDMA_NLDEV_ATTR_RES_LQPN: u16 = 21;

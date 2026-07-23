@@ -361,6 +361,10 @@ fn column_cell(
             let port_text = t.port_label.clone().unwrap_or_else(|| t.port.to_string());
             Cell::from(port_text).style(Style::default().fg(tc.muted))
         }
+        TableColumn::State => {
+            let s = t.state.clone().unwrap_or_else(|| "-".into());
+            Cell::from(s).style(Style::default().fg(state_color(t.state.as_deref(), tc)))
+        }
         TableColumn::TxBar => Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, col_w as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         TableColumn::TxGbps => Cell::from(format!("{:.2}", t.tx_gbps))
@@ -1575,6 +1579,15 @@ fn capacity_color(ratio: f64, tc: &ThemeColors) -> ratatui::style::Color {
 
 /// Color a throughput by % of link capacity; unknown capacity falls back
 /// to the absolute-Gbps rule so ports without a rate don't regress.
+/// Green for ACTIVE, red for DOWN, muted for anything else/unknown.
+fn state_color(state: Option<&str>, tc: &ThemeColors) -> ratatui::style::Color {
+    match state {
+        Some("ACTIVE") => tc.good,
+        Some("DOWN") => tc.error,
+        _ => tc.muted,
+    }
+}
+
 fn throughput_color(gbps: f64, link_gbps: Option<f64>, tc: &ThemeColors) -> ratatui::style::Color {
     match link_gbps.filter(|&c| c > 0.0) {
         Some(cap) => capacity_color(gbps / cap, tc),
@@ -1746,6 +1759,7 @@ mod nvlink_detail_tests {
             dev_name: dev_name.to_string(),
             port: active,
             link_gbps: Some(50.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2037,6 +2051,7 @@ mod nvlink_detail_tests {
             dev_name: "nvidia0".to_string(),
             port: 2,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 1.0,
             tx_pkts_per_sec: 0.0,
@@ -2147,6 +2162,7 @@ mod nvlink_detail_tests {
             dev_name: "nvidia0".to_string(),
             port: 2,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 1.0,
             tx_pkts_per_sec: 0.0,
@@ -2230,6 +2246,7 @@ mod xgmi_detail_tests {
             dev_name: "amdgpu0".to_string(),
             port: active,
             link_gbps: Some(512.0 * active as f64),
+            state: None,
             tx_gbps: 1.0,
             rx_gbps: 2.0,
             tx_pkts_per_sec: 0.0,
@@ -2347,6 +2364,7 @@ mod gpu_table_tests {
             dev_name: "amdgpu0".to_string(),
             port: 7,
             link_gbps: Some(3584.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2374,6 +2392,7 @@ mod gpu_table_tests {
             dev_name: "nvidia0".to_string(),
             port: 18,
             link_gbps: Some(900.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
@@ -2401,6 +2420,7 @@ mod gpu_table_tests {
             dev_name: "mlx5_0".to_string(),
             port: 1,
             link_gbps: Some(100.0),
+            state: None,
             tx_gbps: 0.0,
             rx_gbps: 0.0,
             tx_pkts_per_sec: 0.0,
