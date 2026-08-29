@@ -8,6 +8,12 @@ const NLMSG_HDR_LEN: usize = 16;
 const NLA_HDR_LEN: usize = 4;
 const NLA_ALIGN: usize = 4;
 
+/// Receive timeout for every netlink socket (seconds). A kernel that never
+/// terminates a dump must not wedge the sampler thread forever; recv() then
+/// fails with WouldBlock/TimedOut and the subsystem degrades like any other
+/// read error.
+const RECV_TIMEOUT_SECS: libc::time_t = 2;
+
 fn align(len: usize) -> usize {
     (len + NLA_ALIGN - 1) & !(NLA_ALIGN - 1)
 }
@@ -189,6 +195,28 @@ impl NlSocket {
             unsafe { libc::close(fd) };
             return Err(io::Error::last_os_error());
         }
+        // Bound every recv: a kernel that never terminates a dump (no
+        // NLMSG_DONE/NLMSG_ERROR) must not wedge the sampler thread
+        // forever. Timeouts surface as WouldBlock/TimedOut io::Errors,
+        // which the existing per-subsystem error handling already
+        // degrades gracefully.
+        let tv = libc::timeval {
+            tv_sec: RECV_TIMEOUT_SECS,
+            tv_usec: 0,
+        };
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tv) as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
         Ok(Self { fd })
     }
 
@@ -260,5 +288,31 @@ pub fn collect_responses<T>(
 impl Drop for NlSocket {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: every socket must carry a receive timeout, or a kernel
+    /// that never terminates a dump wedges the sampler thread forever with
+    /// no panic and no surfaced error.
+    #[test]
+    fn open_sets_receive_timeout() {
+        let sock = NlSocket::open(NETLINK_RDMA).expect("open rdma netlink socket");
+        let mut tv: libc::timeval = unsafe { mem::zeroed() };
+        let mut len = std::mem::size_of_val(&tv) as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                sock.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt SO_RCVTIMEO failed");
+        assert_eq!(tv.tv_sec, RECV_TIMEOUT_SECS, "receive timeout not applied");
     }
 }
