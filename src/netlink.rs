@@ -12,7 +12,7 @@ const NLA_ALIGN: usize = 4;
 /// terminates a dump must not wedge the sampler thread forever; recv() then
 /// fails with WouldBlock/TimedOut and the subsystem degrades like any other
 /// read error.
-const RECV_TIMEOUT_SECS: libc::time_t = 2;
+const RECV_TIMEOUT_SECS: libc::time_t = 5;
 
 fn align(len: usize) -> usize {
     (len + NLA_ALIGN - 1) & !(NLA_ALIGN - 1)
