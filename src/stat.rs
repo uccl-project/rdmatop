@@ -67,7 +67,7 @@ fn parse_hw_counter(entry: &Nla) -> HwCounter {
     HwCounter { name, value }
 }
 
-fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
+fn parse_port_counters(nlmsg: &NlMsg) -> Option<PortStat> {
     let mut stat = PortStat {
         dev_name: String::new(),
         port: 0,
@@ -92,9 +92,106 @@ fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
     if stat.dev_name.is_empty() {
         return None;
     }
+    Some(stat)
+}
+
+fn parse_port_stat(nlmsg: &NlMsg) -> Option<PortStat> {
+    let mut stat = parse_port_counters(nlmsg)?;
     fill_missing_from_sysfs(&mut stat);
     stat.link_gbps = read_port_link_gbps(&stat.dev_name, stat.port);
     Some(stat)
+}
+
+/// A fixed port's counter reader for recording without repeated discovery.
+pub struct CounterReader {
+    sock: NlSocket,
+    dev_name: String,
+    dev_idx: u32,
+    port: u32,
+    seq: u32,
+}
+
+impl CounterReader {
+    pub fn open(dev_name: &str, port: u32) -> io::Result<Self> {
+        let sock = NlSocket::open(NETLINK_RDMA)?;
+        let dev = enumerate_devices(&sock)?
+            .into_iter()
+            .find(|dev| dev.name == dev_name && (1..=dev.num_ports).contains(&port))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RDMA port {dev_name}/{port}"),
+                )
+            })?;
+        Ok(Self {
+            sock,
+            dev_name: dev.name,
+            dev_idx: dev.idx,
+            port,
+            seq: 2,
+        })
+    }
+
+    pub fn read(&mut self) -> io::Result<PortStat> {
+        self.seq = self.seq.wrapping_add(1);
+        let msg = NlMsgBuilder::new(
+            rdma_nl_get_type(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET),
+            NLM_F_REQUEST | NLM_F_ACK,
+            self.seq,
+        )
+        .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, self.dev_idx)
+        .put_u32(RDMA_NLDEV_ATTR_PORT_INDEX, self.port)
+        .build();
+        let mut stat = None;
+        for buf in self.sock.request(msg)? {
+            for response in NlMsgIter::new(&buf) {
+                if response.is_error() {
+                    counter_response_error(response.payload)?;
+                } else if !response.is_done() {
+                    stat = parse_port_counters(&response).or(stat);
+                }
+            }
+        }
+        finish_counter_sample(stat, &self.dev_name, self.port, fill_missing_from_sysfs)
+    }
+}
+
+fn counter_response_error(payload: &[u8]) -> io::Result<()> {
+    let code = payload
+        .get(..4)
+        .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated netlink error"))?;
+    // Some providers expose port counters only in sysfs.
+    if code == 0 || code == -libc::EOPNOTSUPP {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(code.saturating_neg()))
+    }
+}
+
+fn finish_counter_sample(
+    stat: Option<PortStat>,
+    dev_name: &str,
+    port: u32,
+    fallback: impl FnOnce(&mut PortStat),
+) -> io::Result<PortStat> {
+    let mut stat = stat.unwrap_or_else(|| PortStat {
+        dev_name: dev_name.to_string(),
+        port,
+        link_gbps: None,
+        state: None,
+        counters: Vec::new(),
+    });
+    // EFA exposes these directly. Providers such as mlx5 need sysfs fallback.
+    if stat.counter_value("tx_bytes").is_none() || stat.counter_value("rx_bytes").is_none() {
+        fallback(&mut stat);
+    }
+    if stat.counters.is_empty() {
+        return Err(io::Error::other(format!(
+            "no counters for {dev_name}/{port}"
+        )));
+    }
+    Ok(stat)
 }
 
 /// Map the IB port state enum (ib_verbs.h `ib_port_state`) to its name.
@@ -580,4 +677,37 @@ pub fn aggregate_by_process(qps: &[QpInfo]) -> Vec<ProcessRdmaInfo> {
         .collect();
     result.sort_by(|a, b| b.qp_count.cmp(&a.qp_count).then(a.pid.cmp(&b.pid)));
     result
+}
+
+#[cfg(test)]
+mod counter_recording_tests {
+    use super::*;
+
+    #[test]
+    fn empty_netlink_response_can_use_sysfs_counters() {
+        let stat = finish_counter_sample(None, "test0", 1, |stat| {
+            assert_eq!(stat.dev_name, "test0");
+            assert_eq!(stat.port, 1);
+            stat.counters.push(HwCounter {
+                name: "tx_bytes".into(),
+                value: 42,
+            });
+        })
+        .unwrap();
+        assert_eq!(stat.counter_value("tx_bytes"), Some(42));
+        assert!(finish_counter_sample(None, "test0", 1, |_| {}).is_err());
+    }
+
+    #[test]
+    fn unsupported_stats_allow_fallback_but_permission_errors_surface() {
+        assert!(counter_response_error(&(-libc::EOPNOTSUPP).to_ne_bytes()).is_ok());
+        assert!(counter_response_error(&0_i32.to_ne_bytes()).is_ok());
+        assert_eq!(
+            counter_response_error(&(-libc::EACCES).to_ne_bytes())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(counter_response_error(&[]).is_err());
+    }
 }

@@ -50,5 +50,13 @@ fn run_tui() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    run_tui()
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        run_tui()
+    } else if args == ["--help"] || args == ["-h"] {
+        println!("{}", trace::HELP);
+        Ok(())
+    } else {
+        trace::run(trace::parse(&args)?)
+    }
 }
