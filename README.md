@@ -13,6 +13,11 @@ Monitors per-device throughput (Gbps, packets/s, drops), RDMA read/write counter
 retransmits, health events, and shows which processes are using each RDMA device —
 all via RDMA netlink, the same interface used by [rdma statistic](https://github.com/iproute2/iproute2/blob/main/rdma/stat.c).
 
+## Blogs
+
+- [rdmatop: Cross-Provider htop for RDMA Traffic](https://uccl-project.github.io/posts/rdma-monitoring/) (2026-06-15)
+- [NVSHMEM Multi-NIC Support with AWS EFA](https://www.pythonsheets.com/notes/appendix/nvshmem-multi-nic.html) (2026-03-27)
+
 ## Requirements
 
 - **Linux** (netlink-based — macOS/Windows are not supported)
