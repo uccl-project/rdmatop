@@ -22,6 +22,16 @@ pub struct PortStat {
 }
 
 impl PortStat {
+    pub fn new(dev_name: String, port: u32) -> Self {
+        Self {
+            dev_name,
+            port,
+            link_gbps: None,
+            state: None,
+            counters: Vec::new(),
+        }
+    }
+
     /// Look up a counter value by name.
     pub fn counter_value(&self, name: &str) -> Option<u64> {
         self.counters
@@ -30,6 +40,30 @@ impl PortStat {
             .map(|c| c.value)
     }
 }
+
+pub const THROUGHPUT_COUNTERS: &[&str] =
+    &["tx_bytes", "rx_bytes", "tx_pkts", "rx_pkts", "rx_drops"];
+
+/// All counter names that can be added as extra columns.
+pub const EXTRA_COUNTERS: &[&str] = &[
+    "send_bytes",
+    "send_wrs",
+    "recv_bytes",
+    "recv_wrs",
+    "rdma_write_bytes",
+    "rdma_write_wrs",
+    "rdma_write_wr_err",
+    "rdma_write_recv_bytes",
+    "rdma_read_bytes",
+    "rdma_read_wrs",
+    "rdma_read_wr_err",
+    "rdma_read_resp_bytes",
+    "retrans_bytes",
+    "retrans_pkts",
+    "retrans_timeout_events",
+    "unresponsive_remote_events",
+    "impaired_remote_conn_events",
+];
 
 struct RdmaDev {
     idx: u32,
@@ -68,13 +102,7 @@ fn parse_hw_counter(entry: &Nla) -> HwCounter {
 }
 
 fn parse_port_counters(nlmsg: &NlMsg) -> Option<PortStat> {
-    let mut stat = PortStat {
-        dev_name: String::new(),
-        port: 0,
-        link_gbps: None,
-        state: None,
-        counters: Vec::new(),
-    };
+    let mut stat = PortStat::new(String::new(), 0);
     for nla in nlmsg.attrs() {
         match nla.attr_type {
             RDMA_NLDEV_ATTR_DEV_NAME => stat.dev_name = nla.str().to_string(),
@@ -134,14 +162,7 @@ impl CounterReader {
 
     pub fn read(&mut self) -> io::Result<PortStat> {
         self.seq = self.seq.wrapping_add(1);
-        let msg = NlMsgBuilder::new(
-            rdma_nl_get_type(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET),
-            NLM_F_REQUEST | NLM_F_ACK,
-            self.seq,
-        )
-        .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, self.dev_idx)
-        .put_u32(RDMA_NLDEV_ATTR_PORT_INDEX, self.port)
-        .build();
+        let msg = port_request(RDMA_NLDEV_CMD_STAT_GET, self.dev_idx, self.port, self.seq);
         let mut stat = None;
         for buf in self.sock.request(msg)? {
             for response in NlMsgIter::new(&buf) {
@@ -175,13 +196,7 @@ fn finish_counter_sample(
     port: u32,
     fallback: impl FnOnce(&mut PortStat),
 ) -> io::Result<PortStat> {
-    let mut stat = stat.unwrap_or_else(|| PortStat {
-        dev_name: dev_name.to_string(),
-        port,
-        link_gbps: None,
-        state: None,
-        counters: Vec::new(),
-    });
+    let mut stat = stat.unwrap_or_else(|| PortStat::new(dev_name.to_string(), port));
     // EFA exposes these directly. Providers such as mlx5 need sysfs fallback.
     if stat.counter_value("tx_bytes").is_none() || stat.counter_value("rx_bytes").is_none() {
         fallback(&mut stat);
@@ -221,16 +236,20 @@ fn parse_port_state(nlmsg: &NlMsg) -> Option<String> {
         .and_then(|nla| port_state_name(nla.u8()))
 }
 
-/// Port state from RDMA netlink, falling back to sysfs.
-fn query_port_state(sock: &NlSocket, dev: &RdmaDev, port: u32, seq: u32) -> Option<String> {
-    let msg = NlMsgBuilder::new(
-        rdma_nl_get_type(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_PORT_GET),
+fn port_request(cmd: u32, dev_idx: u32, port: u32, seq: u32) -> Vec<u8> {
+    NlMsgBuilder::new(
+        rdma_nl_get_type(RDMA_NL_NLDEV, cmd),
         NLM_F_REQUEST | NLM_F_ACK,
         seq,
     )
-    .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, dev.idx)
+    .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, dev_idx)
     .put_u32(RDMA_NLDEV_ATTR_PORT_INDEX, port)
-    .build();
+    .build()
+}
+
+/// Port state from RDMA netlink, falling back to sysfs.
+fn query_port_state(sock: &NlSocket, dev: &RdmaDev, port: u32, seq: u32) -> Option<String> {
+    let msg = port_request(RDMA_NLDEV_CMD_PORT_GET, dev.idx, port, seq);
     collect_responses(sock, msg, parse_port_state)
         .ok()
         .and_then(|v| v.into_iter().next())
@@ -368,14 +387,7 @@ fn query_port_stats(
     port: u32,
     seq: u32,
 ) -> io::Result<Vec<PortStat>> {
-    let msg = NlMsgBuilder::new(
-        rdma_nl_get_type(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_STAT_GET),
-        NLM_F_REQUEST | NLM_F_ACK,
-        seq,
-    )
-    .put_u32(RDMA_NLDEV_ATTR_DEV_INDEX, dev_idx)
-    .put_u32(RDMA_NLDEV_ATTR_PORT_INDEX, port)
-    .build();
+    let msg = port_request(RDMA_NLDEV_CMD_STAT_GET, dev_idx, port, seq);
     collect_responses(sock, msg, parse_port_stat)
 }
 

@@ -1,6 +1,6 @@
 use super::theme::Theme;
 use crate::net::{self, IfStats, NetRate};
-use crate::stat::{self, PortStat};
+use crate::stat::{self, PortStat, EXTRA_COUNTERS};
 use crate::trace::{PortMetrics, Recorder};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -162,27 +162,6 @@ pub const REFRESH_DEFAULT_SECS: f64 = 1.0;
 const REFRESH_MIN_SECS: f64 = 0.2;
 const REFRESH_MAX_SECS: f64 = 10.0;
 const REFRESH_STEP_SECS: f64 = 0.5;
-
-/// All counter names that can be added as extra columns.
-pub const EXTRA_COUNTERS: &[&str] = &[
-    "send_bytes",
-    "send_wrs",
-    "recv_bytes",
-    "recv_wrs",
-    "rdma_write_bytes",
-    "rdma_write_wrs",
-    "rdma_write_wr_err",
-    "rdma_write_recv_bytes",
-    "rdma_read_bytes",
-    "rdma_read_wrs",
-    "rdma_read_wr_err",
-    "rdma_read_resp_bytes",
-    "retrans_bytes",
-    "retrans_pkts",
-    "retrans_timeout_events",
-    "unresponsive_remote_events",
-    "impaired_remote_conn_events",
-];
 
 /// Returns the default set of visible columns.
 pub fn default_columns() -> Vec<TableColumn> {

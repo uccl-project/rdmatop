@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::time::{Duration, Instant};
 
-use crate::stat::{CounterReader, PortStat};
+use crate::stat::{CounterReader, PortStat, EXTRA_COUNTERS, THROUGHPUT_COUNTERS};
 
 /// One device/port's metric values at a single sample instant.
 #[derive(Clone, Debug)]
@@ -177,19 +177,9 @@ fn escape(s: &str) -> String {
     out
 }
 
-const COUNTERS: &[&str] = &[
-    "tx_bytes",
-    "rx_bytes",
-    "tx_pkts",
-    "rx_pkts",
-    "rx_drops",
-    "rdma_write_bytes",
-    "rdma_write_recv_bytes",
-    "rdma_write_wrs",
-    "retrans_bytes",
-    "retrans_pkts",
-    "retrans_timeout_events",
-];
+fn csv_counters() -> impl Iterator<Item = &'static str> {
+    THROUGHPUT_COUNTERS.iter().chain(EXTRA_COUNTERS).copied()
+}
 
 pub const HELP: &str = "\
 Usage: rdmatop
@@ -218,13 +208,18 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+fn required(value: Option<String>, flag: &str) -> io::Result<String> {
+    value
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid(format!("{flag} is required")))
+}
+
 fn seconds(value: &str, scale: f64) -> io::Result<Duration> {
     let number = value
         .parse::<f64>()
-        .map_err(|_| invalid(format!("invalid duration: {value}")))?;
-    if !number.is_finite() || number <= 0.0 {
-        return Err(invalid(format!("invalid duration: {value}")));
-    }
+        .ok()
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .ok_or_else(|| invalid(format!("invalid duration: {value}")))?;
     let duration = Duration::try_from_secs_f64(number * scale)
         .map_err(|_| invalid(format!("duration out of range: {value}")))?;
     if duration.is_zero() {
@@ -268,12 +263,8 @@ pub fn parse(args: &[String]) -> io::Result<Options> {
         return Err(invalid("port must be positive"));
     }
     Ok(Options {
-        path: path
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid("--output is required"))?,
-        device: device
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid("--device is required"))?,
+        path: required(path, "--output")?,
+        device: required(device, "--device")?,
         port,
         interval,
         duration,
@@ -290,7 +281,7 @@ fn monotonic_ns() -> io::Result<u64> {
 
 fn write_row(out: &mut impl Write, start: u64, end: u64, stat: &PortStat) -> io::Result<()> {
     write!(out, "{start},{end}")?;
-    for name in COUNTERS {
+    for name in csv_counters() {
         write!(out, ",")?;
         if let Some(value) = stat.counter_value(name) {
             write!(out, "{value}")?;
@@ -311,7 +302,8 @@ pub fn run(options: Options) -> io::Result<()> {
         .create_new(true)
         .open(&options.path)?;
     let mut out = BufWriter::with_capacity(64 * 1024, file);
-    writeln!(out, "poll_start_ns,poll_end_ns,{}", COUNTERS.join(","))?;
+    let header: Vec<_> = csv_counters().collect();
+    writeln!(out, "poll_start_ns,poll_end_ns,{}", header.join(","))?;
     out.flush()?;
     let started = Instant::now();
     let mut samples = 0u64;
@@ -441,21 +433,16 @@ mod tests {
 
     #[test]
     fn absent_counter_is_empty_instead_of_zero() {
-        let stat = PortStat {
-            dev_name: "efa0".into(),
-            port: 1,
-            link_gbps: None,
-            state: None,
-            counters: vec![HwCounter {
-                name: "tx_bytes".into(),
-                value: 42,
-            }],
-        };
+        let mut stat = PortStat::new("efa0".into(), 1);
+        stat.counters.push(HwCounter {
+            name: "tx_bytes".into(),
+            value: 42,
+        });
         let mut row = Vec::new();
         write_row(&mut row, 100, 200, &stat).unwrap();
         let row = String::from_utf8(row).unwrap();
         let fields: Vec<_> = row.trim_end().split(',').collect();
-        assert_eq!(fields.len(), 2 + COUNTERS.len());
+        assert_eq!(fields.len(), 2 + csv_counters().count());
         assert_eq!(&fields[..4], &["100", "200", "42", ""]);
     }
 

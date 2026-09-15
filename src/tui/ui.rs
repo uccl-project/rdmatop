@@ -6,11 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{
-    all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn, EXTRA_COUNTERS,
-};
+use super::app::{all_columns, App, CounterRate, DeviceClass, PortThroughput, TableColumn};
 use super::theme::ThemeColors;
 use crate::gpu::GpuMetrics;
+use crate::stat::EXTRA_COUNTERS;
 
 const HELP_KEYS: &[(&str, &str)] = &[
     ("↑ / k", "Move up"),
