@@ -7,6 +7,10 @@ license = "Apache-2.0"
 repository = "https://github.com/uccl-project/rdmatop"
 keywords = ["rdma", "efa", "networking", "tui", "infiniband"]
 categories = ["network-programming", "command-line-utilities"]
+exclude = ["images/", "examples/", "python/", "kineto/", "debian/", "Dockerfile", ".github/"]
+
+[lib]
+crate-type = ["rlib", "staticlib"]
 
 [profile.release]
 strip = true

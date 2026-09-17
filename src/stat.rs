@@ -41,6 +41,18 @@ impl PortStat {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn port_stat(dev: &str, port: u32, counters: &[(&str, u64)]) -> PortStat {
+    let mut stat = PortStat::new(dev.to_string(), port);
+    for (name, value) in counters {
+        stat.counters.push(HwCounter {
+            name: name.to_string(),
+            value: *value,
+        });
+    }
+    stat
+}
+
 pub const THROUGHPUT_COUNTERS: &[&str] =
     &["tx_bytes", "rx_bytes", "tx_pkts", "rx_pkts", "rx_drops"];
 

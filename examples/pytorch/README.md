@@ -60,3 +60,22 @@ Compare it against the per-row TX in `rdmatop`.
   — collective API used by the scripts
 - [rccl](https://github.com/ROCm/rccl) — AMD collective library
 - [nccl](https://github.com/NVIDIA/nccl) — NVIDIA collective library
+
+## Profiler integration
+
+`profile.py` runs `all_reduce` under `torch.profiler` with rdmatop's RDMA
+counters recorded in the same trace:
+
+```bash
+pip install "setuptools>=64" "torch>=2.12"
+pip install --no-build-isolation -e ../../python   # builds against the installed torch
+torchrun --nproc_per_node=2 profile.py --out trace.json
+```
+
+Only local rank 0 enables rdmatop, so each host's NICs are sampled once.
+
+Open `trace.json` in [ui.perfetto.dev](https://ui.perfetto.dev): the `rdmatop`
+process holds one `<device>:<port>` counter group per RDMA port with
+`tx_gbps`, `rx_gbps`, `tx_pps`, `rx_pps`, and `rx_drops_per_sec` lines next to
+the CUDA kernels. `RDMATOP_INTERVAL_MS` (default 10) sets the sample interval,
+`RDMATOP_DEVICES=mlx5_0,mlx5_1` restricts the devices.
