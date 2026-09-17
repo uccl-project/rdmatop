@@ -1,11 +1,10 @@
 import argparse
 import os
 
+import rdmatop.kineto
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile
-
-import rdmatop.kineto
 
 
 def main():
@@ -17,7 +16,7 @@ def main():
     parser.add_argument("--out", default="trace.json")
     args = parser.parse_args()
 
-    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
         rdmatop.kineto.enable()
     dist.init_process_group("nccl")
     rank = dist.get_rank()

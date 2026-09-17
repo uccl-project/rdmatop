@@ -67,7 +67,7 @@ Compare it against the per-row TX in `rdmatop`.
 counters recorded in the same trace:
 
 ```bash
-pip install "setuptools>=64" "torch>=2.12"
+pip install "setuptools>=64" "torch>=2.9"
 pip install --no-build-isolation -e ../../python   # builds against the installed torch
 torchrun --nproc_per_node=2 profile.py --out trace.json
 ```

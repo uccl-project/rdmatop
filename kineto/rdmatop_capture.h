@@ -10,6 +10,7 @@ typedef void (*rdmatop_sample_fn)(void* ctx, uint64_t ts_ns, const char* dev,
 
 void* rdmatop_capture_start(uint64_t interval_us, const char* devices_csv);
 void rdmatop_capture_stop(void* handle);
+// Stops an active capture before replaying its samples; repeated calls replay them again.
 void rdmatop_capture_for_each(void* handle, rdmatop_sample_fn cb, void* ctx);
 const char* rdmatop_capture_error(void* handle);
 void rdmatop_capture_free(void* handle);

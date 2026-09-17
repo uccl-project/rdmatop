@@ -63,7 +63,11 @@ struct Collector {
     if (!continuesLast(tsNs, name)) {
       startActivity(tsNs, name);
     }
+#if RDMATOP_TYPED_COUNTERS
     activities.back().addCounterValue(metric, value);
+#else
+    activities.back().addMetadata(metric, value);
+#endif
   }
 
   bool continuesLast(uint64_t tsNs, const std::string& name) const {
@@ -72,7 +76,13 @@ struct Collector {
 
   void startActivity(uint64_t tsNs, const std::string& name) {
     libkineto::GenericTraceActivity activity;
+#if RDMATOP_NATIVE_COUNTERS
     activity.activityType = libkineto::ActivityType::MTIA_COUNTERS;
+#else
+    // CPU event types are reserved for events owned by the PyTorch profiler.
+    activity.activityType = libkineto::ActivityType::PRIVATEUSE1_RUNTIME;
+    activity.addMetadata("rdmatop_counter", 1);
+#endif
     activity.activityName = name;
     activity.startTime = static_cast<int64_t>(tsNs);
     activity.endTime = static_cast<int64_t>(tsNs);
@@ -113,6 +123,7 @@ class RdmatopSession : public libkineto::IActivityProfilerSession {
     if (!handle_) {
       return;
     }
+    rdmatop_capture_stop(handle_.get());
     rdmatop_capture_for_each(handle_.get(), &Collector::onSample, &collector_);
     if (const char* message = rdmatop_capture_error(handle_.get())) {
       fail(message);
@@ -137,13 +148,19 @@ class RdmatopSession : public libkineto::IActivityProfilerSession {
     if (collector_.activities.empty()) {
       return nullptr;
     }
-    return std::make_unique<libkineto::DeviceInfo>(kDeviceId, kSortIndex, kName, kName);
+    return std::make_unique<libkineto::DeviceInfo>(
+        libkineto::DeviceInfo{kDeviceId, kSortIndex, kName, kName});
   }
 
   std::vector<libkineto::ResourceInfo> getResourceInfos() override {
     std::vector<libkineto::ResourceInfo> infos;
     for (const auto& [name, id] : collector_.resources) {
-      infos.emplace_back(kDeviceId, id, id, name);
+      // Older Kineto constructors and newer aggregates order the IDs differently.
+      libkineto::ResourceInfo info{0, 0, 0, name};
+      info.deviceId = kDeviceId;
+      info.id = id;
+      info.sortIndex = id;
+      infos.push_back(std::move(info));
     }
     return infos;
   }
@@ -195,6 +212,10 @@ class RdmatopProfiler : public libkineto::IActivityProfiler {
 bool registered = false;
 
 }  // namespace
+
+extern "C" int rdmatop_kineto_has_native_counters(void) {
+  return RDMATOP_NATIVE_COUNTERS;
+}
 
 extern "C" int rdmatop_kineto_register(void) {
   if (registered) {

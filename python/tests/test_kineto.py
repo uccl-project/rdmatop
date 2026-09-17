@@ -1,22 +1,29 @@
+import gzip
 import json
 import os
 import time
 
 import pytest
-import torch
-from torch.profiler import ProfilerActivity, profile, schedule
-
 import rdmatop.kineto
+import torch
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+    schedule,
+    tensorboard_trace_handler,
+)
 
 METRICS = {"tx_gbps", "rx_gbps", "tx_pps", "rx_pps", "rx_drops_per_sec"}
 
 
 def has_rdma():
-    return os.path.isdir("/sys/class/infiniband") and bool(os.listdir("/sys/class/infiniband"))
+    return os.path.isdir("/sys/class/infiniband") and bool(
+        os.listdir("/sys/class/infiniband")
+    )
 
 
-def workload():
-    x = torch.randn(256, 256)
+def workload(device="cpu"):
+    x = torch.randn(256, 256, device=device)
     for _ in range(10):
         x = x @ x.T
         time.sleep(0.005)
@@ -24,12 +31,16 @@ def workload():
 
 def export_trace(prof, path):
     prof.export_chrome_trace(str(path))
-    return json.loads(path.read_text())
+    open_trace = gzip.open if path.suffix == ".gz" else open
+    with open_trace(path, "rt") as source:
+        return json.load(source)
 
 
 def rdmatop_counters(trace):
     events = trace["traceEvents"]
-    process_names = [e for e in events if e.get("ph") == "M" and e.get("name") == "process_name"]
+    process_names = [
+        e for e in events if e.get("ph") == "M" and e.get("name") == "process_name"
+    ]
     pids = {e["pid"] for e in process_names if e["args"]["name"] == "rdmatop"}
     return [e for e in events if e.get("ph") == "C" and e["pid"] in pids]
 
@@ -44,14 +55,26 @@ def counter_window_ns(trace):
 
 
 @pytest.mark.skipif(not has_rdma(), reason="no RDMA devices")
-def test_profile_contains_rdmatop_counter_tracks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("suffix", [".json", ".json.gz"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_profile_contains_rdmatop_counter_tracks(
+    tmp_path, monkeypatch, capfd, suffix, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
     rdmatop.kineto.enable()
     monkeypatch.setenv("RDMATOP_INTERVAL_MS", "5")
     before_ns = time.time_ns()
-    with profile(activities=[ProfilerActivity.CPU]) as prof:
-        workload()
+    activities = [ProfilerActivity.CPU]
+    if device == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+    with profile(activities=activities) as prof:
+        workload(device)
+    assert "not maintained address stability" not in capfd.readouterr().err
     after_ns = time.time_ns()
-    trace = export_trace(prof, tmp_path / "trace.json")
+    trace = export_trace(prof, tmp_path / f"trace{suffix}")
+    if device == "cuda":
+        assert any(event.get("cat") == "kernel" for event in trace["traceEvents"])
 
     counters = rdmatop_counters(trace)
     assert len(counters) >= 5, f"expected counter events, got {len(counters)}"
@@ -59,6 +82,18 @@ def test_profile_contains_rdmatop_counter_tracks(tmp_path, monkeypatch):
         assert set(event["args"]) == METRICS
         assert ":" in event["name"]
         assert before_ns <= event_ns(trace, event) <= after_ns
+    port_names = {event["name"] for event in counters}
+    counter_pids = {event["pid"] for event in counters}
+    resources = [
+        event
+        for event in trace["traceEvents"]
+        if event.get("ph") == "M"
+        and event.get("name") == "thread_name"
+        and event.get("args", {}).get("name") in port_names
+    ]
+    assert {event["args"]["name"] for event in resources} == port_names
+    assert {event["pid"] for event in resources} == counter_pids
+    assert len({event["tid"] for event in resources}) == len(port_names)
 
 
 @pytest.mark.skipif(not has_rdma(), reason="no RDMA devices")
@@ -71,7 +106,11 @@ def test_scheduled_cycles_each_get_their_own_samples(tmp_path, monkeypatch):
         traces.append(export_trace(prof, tmp_path / f"cycle{len(traces)}.json"))
 
     cycles = schedule(wait=0, warmup=1, active=1, repeat=2)
-    with profile(activities=[ProfilerActivity.CPU], schedule=cycles, on_trace_ready=on_trace_ready) as prof:
+    with profile(
+        activities=[ProfilerActivity.CPU],
+        schedule=cycles,
+        on_trace_ready=on_trace_ready,
+    ) as prof:
         for _ in range(4):
             workload()
             prof.step()
@@ -84,4 +123,19 @@ def test_scheduled_cycles_each_get_their_own_samples(tmp_path, monkeypatch):
 
 def test_enable_is_idempotent():
     rdmatop.kineto.enable()
+    exporter = profile.export_chrome_trace
     rdmatop.kineto.enable()
+    assert profile.export_chrome_trace is exporter
+
+
+@pytest.mark.skipif(not has_rdma(), reason="no RDMA devices")
+def test_tensorboard_handler_exports_compressed_counters(tmp_path, monkeypatch):
+    rdmatop.kineto.enable()
+    monkeypatch.setenv("RDMATOP_INTERVAL_MS", "5")
+    handler = tensorboard_trace_handler(str(tmp_path), use_gzip=True)
+    with profile(activities=[ProfilerActivity.CPU], on_trace_ready=handler):
+        workload()
+    paths = list(tmp_path.glob("*.pt.trace.json.gz"))
+    assert len(paths) == 1
+    with gzip.open(paths[0], "rt") as source:
+        assert rdmatop_counters(json.load(source))

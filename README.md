@@ -83,13 +83,21 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
 prof.export_chrome_trace("trace.json")
 ```
 
-The shim links against the installed torch (>= 2.12), so it is built from a
-checkout with `cargo` and a C++17 compiler on `PATH`:
+The shim links against the installed torch (>= 2.9), so it is built from a
+checkout with `cargo` and a C++ compiler on `PATH`. PyTorch selects the required
+C++ standard (C++17 or C++20, depending on its version). Rebuild the shim after
+changing PyTorch versions:
 
 ```bash
-pip install "setuptools>=64" "torch>=2.12"
+pip install "setuptools>=64" "torch>=2.9"
 pip install --no-build-isolation -e ./python
 ```
+
+On older Kineto versions without native counters, `enable()` wraps
+`torch.profiler.profile.export_chrome_trace()` to convert rdmatop's marked
+events into counter tracks. This also supports gzip exports and
+`tensorboard_trace_handler`; raw Kineto exports retain zero-duration events.
+Newer versions emit native counters and need no export wrapper.
 
 ## Examples
 
