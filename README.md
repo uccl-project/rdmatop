@@ -6,7 +6,7 @@
 `htop`, but for RDMA traffic — a real-time TUI monitor for RDMA network interfaces.
 
 <p align="center">
-  <img src="images/rdmatop.gif" alt="rdmatop" width="800">
+  <img src="https://raw.githubusercontent.com/uccl-project/rdmatop/main/images/rdmatop.gif" alt="rdmatop" width="800">
 </p>
 
 Monitors per-device throughput (Gbps, packets/s, drops), RDMA read/write counters,
@@ -63,7 +63,7 @@ trace (`rdmatop-<unix_timestamp>.json`, in the current directory) you can drag i
 to when you pressed `r`, so the trace spans exactly your record window.
 
 <p align="center">
-  <img src="images/perfetto.png" alt="rdmatop Perfetto recording" width="800">
+  <img src="https://raw.githubusercontent.com/uccl-project/rdmatop/main/images/perfetto.png" alt="rdmatop Perfetto recording" width="800">
 </p>
 
 ## PyTorch profiler
