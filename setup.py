@@ -1,19 +1,19 @@
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-HERE = os.path.abspath(os.path.dirname(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.abspath(os.path.dirname(__file__))
 TARGET_DIR = os.path.join(ROOT, "target")
 STATICLIB = os.path.join(TARGET_DIR, "release", "librdmatop.a")
 KINETO_DIR = os.path.join(ROOT, "kineto")
 CAPTURE_HEADER = os.path.join(KINETO_DIR, "rdmatop_capture.h")
-SHIM_SOURCE = os.path.relpath(os.path.join(KINETO_DIR, "rdmatop_kineto.cpp"), HERE)
+SHIM_SOURCE = "kineto/rdmatop_kineto.cpp"
 TORCH_DIR = os.path.dirname(torch.__file__)
 TORCH_LIB = os.path.join(TORCH_DIR, "lib")
 KINETO_INCLUDE = os.path.join(TORCH_DIR, "include", "kineto")
@@ -34,13 +34,30 @@ def kineto_capabilities():
 
 class BuildRustThenExt(BuildExtension):
     def run(self):
+        if sys.platform != "linux":
+            raise SystemExit("rdmatop: only Linux is supported")
         if shutil.which("cargo") is None:
             raise SystemExit("rdmatop: cargo not found on PATH; install Rust first")
         env = {**os.environ, "CARGO_TARGET_DIR": TARGET_DIR}
         subprocess.check_call(
-            ["cargo", "build", "--release", "--lib"], cwd=ROOT, env=env
+            ["cargo", "build", "--release", "--lib", "--bin", "rdmatop"],
+            cwd=ROOT,
+            env=env,
         )
         super().run()
+        binary_dir = (
+            Path(self.get_ext_fullpath("rdmatop._rdmatop_kineto")).parent / "bin"
+        )
+        binary_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(TARGET_DIR) / "release" / "rdmatop", binary_dir / "rdmatop")
+
+    def get_outputs(self):
+        binary = (
+            Path(self.get_ext_fullpath("rdmatop._rdmatop_kineto")).parent
+            / "bin"
+            / "rdmatop"
+        )
+        return [*super().get_outputs(), str(binary)]
 
 
 def cargo_version():
@@ -54,6 +71,8 @@ def cargo_version():
 
 setup(
     version=cargo_version(),
+    # Kineto's C++ ABI is tied to the PyTorch version used for compilation.
+    install_requires=[f"torch=={torch.__version__.split('+')[0]}"],
     ext_modules=[
         CppExtension(
             name="rdmatop._rdmatop_kineto",
@@ -62,7 +81,10 @@ setup(
             depends=[STATICLIB, CAPTURE_HEADER],
             extra_objects=[STATICLIB],
             define_macros=kineto_capabilities(),
-            extra_link_args=[f"-Wl,-rpath,{TORCH_LIB}", "-Wl,--exclude-libs,ALL"]
+            extra_link_args=[
+                f"-Wl,-rpath,{TORCH_LIB}",
+                "-Wl,--exclude-libs,ALL",
+            ]
             + RUST_RUNTIME_LIBS,
             libraries=["torch_cpu"],
         )
