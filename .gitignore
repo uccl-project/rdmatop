@@ -297,3 +297,4 @@ tags
 .cargo/
 vendor/
 .worktrees/
+python/rdmatop/bin/

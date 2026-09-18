@@ -66,6 +66,39 @@ to when you pressed `r`, so the trace spans exactly your record window.
   <img src="images/perfetto.png" alt="rdmatop Perfetto recording" width="800">
 </p>
 
+## PyTorch profiler
+
+rdmatop can run inside the training process as a Kineto child profiler, so
+RDMA counter tracks land in the same trace `torch.profiler` writes:
+
+```python
+import torch
+from torch.profiler import ProfilerActivity, profile
+
+import rdmatop.kineto
+
+rdmatop.kineto.enable()
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    train_step()
+prof.export_chrome_trace("trace.json")
+```
+
+The shim links against the installed torch (>= 2.9), so it is built from a
+checkout with `cargo` and a C++ compiler on `PATH`. PyTorch selects the required
+C++ standard (C++17 or C++20, depending on its version). Rebuild the shim after
+changing PyTorch versions:
+
+```bash
+pip install "setuptools>=64" "torch>=2.9"
+pip install --no-build-isolation -e ./python
+```
+
+On older Kineto versions without native counters, `enable()` wraps
+`torch.profiler.profile.export_chrome_trace()` to convert rdmatop's marked
+events into counter tracks. This also supports gzip exports and
+`tensorboard_trace_handler`; raw Kineto exports retain zero-duration events.
+Newer versions emit native counters and need no export wrapper.
+
 ## Examples
 
 Use `rdmatop` to monitor RDMA traffic while running GPU

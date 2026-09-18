@@ -1,4 +1,5 @@
 use super::theme::Theme;
+use crate::metrics::{self, bytes_to_gbps};
 use crate::net::{self, IfStats, NetRate};
 use crate::stat::{self, PortStat, EXTRA_COUNTERS};
 use crate::trace::{PortMetrics, Recorder};
@@ -85,14 +86,7 @@ pub struct NvLinkThroughputMeta {
     pub metrics: Option<crate::gpu::GpuMetrics>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CounterRate {
-    pub name: String,
-    pub value: u64,
-    pub delta: u64,
-    pub rate: f64,
-    pub is_bytes: bool,
-}
+pub use crate::metrics::CounterRate;
 
 /// Columns available for the main throughput table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +426,12 @@ pub struct SysInfo {
     pub mem_pct: f32,
     pub cpu_pct: f32,
     pub net: NetRate,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {
@@ -978,69 +978,23 @@ fn trace_filename() -> String {
     format!("rdmatop-{}.json", secs)
 }
 
-fn find_prev<'a>(prev: &'a [PortStat], dev: &str, port: u32) -> Option<&'a PortStat> {
-    prev.iter().find(|s| s.dev_name == dev && s.port == port)
-}
-
-fn bytes_to_gbps(bytes_per_sec: f64) -> f64 {
-    bytes_per_sec * 8.0 / 1_000_000_000.0
-}
-
-fn is_bytes_counter(name: &str) -> bool {
-    name.ends_with("_bytes") || name.ends_with("_resp_bytes") || name.ends_with("_recv_bytes")
-}
-
-fn compute_counter_rate(
-    counter_name: &str,
-    curr_val: u64,
-    prev: Option<&PortStat>,
-    elapsed: f64,
-) -> CounterRate {
-    let prev_val = prev
-        .and_then(|p| p.counter_value(counter_name))
-        .unwrap_or(0);
-    let delta = curr_val.saturating_sub(prev_val);
-    CounterRate {
-        name: counter_name.to_string(),
-        value: curr_val,
-        delta,
-        rate: delta as f64 / elapsed,
-        is_bytes: is_bytes_counter(counter_name),
-    }
-}
-
-fn rate_by_name(rates: &[CounterRate], name: &str) -> f64 {
-    rates
-        .iter()
-        .find(|r| r.name == name)
-        .map(|r| r.rate)
-        .unwrap_or(0.0)
-}
-
 fn compute_port_throughput(
     curr: &PortStat,
     prev: Option<&PortStat>,
     elapsed: f64,
 ) -> PortThroughput {
-    let counter_rates: Vec<CounterRate> = curr
-        .counters
-        .iter()
-        .map(|c| compute_counter_rate(&c.name, c.value, prev, elapsed))
-        .collect();
-
-    let tx_bps = rate_by_name(&counter_rates, "tx_bytes");
-    let rx_bps = rate_by_name(&counter_rates, "rx_bytes");
-
+    let counter_rates = metrics::counter_rates(curr, prev, elapsed);
+    let rates = metrics::port_metrics(curr, prev, elapsed);
     PortThroughput {
-        dev_name: curr.dev_name.clone(),
-        port: curr.port,
+        dev_name: rates.dev_name,
+        port: rates.port,
         link_gbps: curr.link_gbps,
         state: curr.state.clone(),
-        tx_gbps: bytes_to_gbps(tx_bps),
-        rx_gbps: bytes_to_gbps(rx_bps),
-        tx_pkts_per_sec: rate_by_name(&counter_rates, "tx_pkts"),
-        rx_pkts_per_sec: rate_by_name(&counter_rates, "rx_pkts"),
-        rx_drops_per_sec: rate_by_name(&counter_rates, "rx_drops"),
+        tx_gbps: rates.tx_gbps,
+        rx_gbps: rates.rx_gbps,
+        tx_pkts_per_sec: rates.tx_pps,
+        rx_pkts_per_sec: rates.rx_pps,
+        rx_drops_per_sec: rates.rx_drops_per_sec,
         counter_rates,
         port_label: None,
         nvlink: None,
@@ -1051,7 +1005,7 @@ fn compute_port_throughput(
 
 fn compute_throughputs(prev: &[PortStat], curr: &[PortStat], elapsed: f64) -> Vec<PortThroughput> {
     curr.iter()
-        .map(|c| compute_port_throughput(c, find_prev(prev, &c.dev_name, c.port), elapsed))
+        .map(|c| compute_port_throughput(c, metrics::find_prev(prev, &c.dev_name, c.port), elapsed))
         .collect()
 }
 
