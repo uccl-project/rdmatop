@@ -1,6 +1,7 @@
 # rdmatop
 
 [![Crates.io](https://img.shields.io/crates/v/rdmatop)](https://crates.io/crates/rdmatop)
+[![PyPI](https://img.shields.io/pypi/v/rdmatop)](https://pypi.org/project/rdmatop/)
 [![License](https://img.shields.io/crates/l/rdmatop)](LICENSE)
 
 `htop`, but for RDMA traffic — a real-time TUI monitor for RDMA network interfaces.
