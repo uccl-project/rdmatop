@@ -67,7 +67,7 @@ jobs:
         with:
           name: pypi-source
           path: dist
-      - run: python -m pip install "setuptools>=77" wheel ninja numpy pytest
+      - run: python -m pip install "setuptools>=77" wheel ninja numpy pytest "viztracer>=1.1.1"
       - run: python -m pip install "torch==${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
       - name: Install the source archive outside the checkout
         working-directory: ${{ runner.temp }}

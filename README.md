@@ -100,6 +100,24 @@ events into counter tracks. This also supports gzip exports and
 `tensorboard_trace_handler`; raw Kineto exports retain zero-duration events.
 Newer versions emit native counters and need no export wrapper.
 
+## VizTracer
+
+```bash
+pip install "viztracer>=1.1.1"
+viztracer --plugins rdmatop.viztracer -- my_script.py
+```
+
+```python
+from viztracer import VizTracer
+
+with VizTracer(plugins=["rdmatop.viztracer"], output_file="trace.json"):
+    train_step()
+```
+
+```bash
+viztracer --plugins "rdmatop.viztracer --interval 1 --devices mlx5_0,mlx5_1" -- my_script.py
+```
+
 ## Examples
 
 Use `rdmatop` to monitor RDMA traffic while running GPU

@@ -16,6 +16,9 @@ classifiers = ["Operating System :: POSIX :: Linux", "Programming Language :: Py
 Homepage = "https://github.com/uccl-project/rdmatop"
 Issues = "https://github.com/uccl-project/rdmatop/issues"
 
+[project.optional-dependencies]
+viztracer = ["viztracer>=1.1.1"]
+
 [project.scripts]
 rdmatop = "rdmatop._cli:main"
 

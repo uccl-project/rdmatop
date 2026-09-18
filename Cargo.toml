@@ -10,7 +10,7 @@ categories = ["network-programming", "command-line-utilities"]
 exclude = ["images/", "examples/", "python/", "kineto/", "debian/", "Dockerfile", ".github/"]
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [profile.release]
 strip = true
