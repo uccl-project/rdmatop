@@ -29,8 +29,14 @@ jobs:
       - name: Authenticate to crates.io (Trusted Publishing)
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
+        continue-on-error: true
+
+      - name: Retry crates.io authentication
+        if: steps.auth.outcome == 'failure'
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth_retry
 
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth_retry.outputs.token || steps.auth.outputs.token }}
         run: cargo publish
