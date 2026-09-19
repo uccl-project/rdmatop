@@ -50,6 +50,10 @@ class BuildRustThenExt(BuildExtension):
         )
         binary_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path(TARGET_DIR) / "release" / "rdmatop", binary_dir / "rdmatop")
+        shutil.copy2(
+            Path(TARGET_DIR) / "release" / "librdmatop.so",
+            binary_dir.parent / "librdmatop.so",
+        )
 
     def get_outputs(self):
         binary = (
@@ -57,7 +61,11 @@ class BuildRustThenExt(BuildExtension):
             / "bin"
             / "rdmatop"
         )
-        return [*super().get_outputs(), str(binary)]
+        return [
+            *super().get_outputs(),
+            str(binary),
+            str(binary.parent.parent / "librdmatop.so"),
+        ]
 
 
 def cargo_version():
