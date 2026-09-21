@@ -26,6 +26,12 @@ all via RDMA netlink, the same interface used by [rdma statistic](https://github
 
 ## Installation
 
+### Python package
+
+```bash
+pip install rdmatop
+```
+
 ### Ubuntu (PPA)
 
 On Ubuntu 22.04 (jammy), 24.04 (noble), or 26.04 (resolute) — amd64 and arm64:
@@ -90,8 +96,8 @@ C++ standard (C++17 or C++20, depending on its version). Rebuild the shim after
 changing PyTorch versions:
 
 ```bash
-pip install "setuptools>=64" "torch>=2.9"
-pip install --no-build-isolation -e ./python
+pip install "setuptools>=77" "torch>=2.9"
+pip install --no-build-isolation -e .
 ```
 
 On older Kineto versions without native counters, `enable()` wraps

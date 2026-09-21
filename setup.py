@@ -1,12 +1,19 @@
 import os
+import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import torch
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+from setuptools import Distribution, setup
+
+# Keep this selection aligned with the build dependency marker in pyproject.toml.
+BUILD_KINETO = platform.machine() not in {"armv6l", "armv7l", "armv8l"}
+if BUILD_KINETO:
+    import torch
+    from torch.utils.cpp_extension import BuildExtension, CppExtension
+else:
+    from setuptools.command.build_ext import build_ext as BuildExtension
 
 ROOT = os.path.abspath(os.path.dirname(__file__))
 TARGET_DIR = os.path.join(ROOT, "target")
@@ -14,14 +21,11 @@ STATICLIB = os.path.join(TARGET_DIR, "release", "librdmatop.a")
 KINETO_DIR = os.path.join(ROOT, "kineto")
 CAPTURE_HEADER = os.path.join(KINETO_DIR, "rdmatop_capture.h")
 SHIM_SOURCE = "kineto/rdmatop_kineto.cpp"
-TORCH_DIR = os.path.dirname(torch.__file__)
-TORCH_LIB = os.path.join(TORCH_DIR, "lib")
-KINETO_INCLUDE = os.path.join(TORCH_DIR, "include", "kineto")
 RUST_RUNTIME_LIBS = ["-ldl", "-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm"]
 
 
-def kineto_capabilities():
-    headers = Path(KINETO_INCLUDE)
+def kineto_capabilities(include_dir):
+    headers = Path(include_dir)
     activity_types = (headers / "ActivityType.h").read_text()
     trace_activity = (headers / "GenericTraceActivity.h").read_text()
     # Older wheels do not export fmt symbols used by inline Kineto metadata APIs.
@@ -30,6 +34,12 @@ def kineto_capabilities():
         ("RDMATOP_NATIVE_COUNTERS", str(int("MTIA_COUNTERS" in activity_types))),
         ("RDMATOP_TYPED_COUNTERS", str(int("addCounterValue(" in trace_activity))),
     ]
+
+
+class NativeDistribution(Distribution):
+    def has_ext_modules(self):
+        # The Rust executable and shared library are native even without Kineto.
+        return True
 
 
 class BuildRustThenExt(BuildExtension):
@@ -44,7 +54,7 @@ class BuildRustThenExt(BuildExtension):
             cwd=ROOT,
             env=env,
         )
-        super().run()
+        self.build_kineto()
         binary_dir = (
             Path(self.get_ext_fullpath("rdmatop._rdmatop_kineto")).parent / "bin"
         )
@@ -54,6 +64,10 @@ class BuildRustThenExt(BuildExtension):
             Path(TARGET_DIR) / "release" / "librdmatop.so",
             binary_dir.parent / "librdmatop.so",
         )
+
+    def build_kineto(self):
+        if BUILD_KINETO:
+            super().run()
 
     def get_outputs(self):
         binary = (
@@ -77,25 +91,40 @@ def cargo_version():
     raise SystemExit("rdmatop: version not found in Cargo.toml")
 
 
+def kineto_extensions():
+    if not BUILD_KINETO:
+        return []
+    torch_dir = Path(torch.__file__).parent
+    torch_lib = str(torch_dir / "lib")
+    kineto_include = str(torch_dir / "include" / "kineto")
+    extension = CppExtension(
+        name="rdmatop._rdmatop_kineto",
+        sources=[SHIM_SOURCE],
+        include_dirs=[kineto_include, KINETO_DIR],
+        depends=[STATICLIB, CAPTURE_HEADER],
+        extra_objects=[STATICLIB],
+        define_macros=kineto_capabilities(kineto_include),
+        extra_link_args=[
+            f"-Wl,-rpath,{torch_lib}",
+            "-Wl,--exclude-libs,ALL",
+        ]
+        + RUST_RUNTIME_LIBS,
+        libraries=["torch_cpu"],
+    )
+    return [extension]
+
+
+def runtime_dependencies():
+    if not BUILD_KINETO:
+        return []
+    # Kineto's C++ ABI is tied to the PyTorch version used for compilation.
+    return [f"torch=={torch.__version__.split('+')[0]}"]
+
+
 setup(
     version=cargo_version(),
-    # Kineto's C++ ABI is tied to the PyTorch version used for compilation.
-    install_requires=[f"torch=={torch.__version__.split('+')[0]}"],
-    ext_modules=[
-        CppExtension(
-            name="rdmatop._rdmatop_kineto",
-            sources=[SHIM_SOURCE],
-            include_dirs=[KINETO_INCLUDE, KINETO_DIR],
-            depends=[STATICLIB, CAPTURE_HEADER],
-            extra_objects=[STATICLIB],
-            define_macros=kineto_capabilities(),
-            extra_link_args=[
-                f"-Wl,-rpath,{TORCH_LIB}",
-                "-Wl,--exclude-libs,ALL",
-            ]
-            + RUST_RUNTIME_LIBS,
-            libraries=["torch_cpu"],
-        )
-    ],
+    install_requires=runtime_dependencies(),
+    ext_modules=kineto_extensions(),
+    distclass=NativeDistribution,
     cmdclass={"build_ext": BuildRustThenExt},
 )
