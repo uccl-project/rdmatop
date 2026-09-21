@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=77", "torch>=2.9"]
+requires = [
+    "setuptools>=77",
+    "torch>=2.9; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l'",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
