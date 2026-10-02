@@ -351,6 +351,7 @@ pub struct App {
     prev_nvlink_at: Option<Instant>,
     prev_xgmi_at: Option<Instant>,
     prev_taken_at: Option<Instant>,
+    last_applied_at: Option<Instant>,
     rdma_rows: Vec<PortThroughput>,
     nvlink_rows: Vec<PortThroughput>,
     xgmi_rows: Vec<PortThroughput>,
@@ -456,6 +457,7 @@ impl App {
             prev_nvlink_at: None,
             prev_xgmi_at: None,
             prev_taken_at: None,
+            last_applied_at: None,
             rdma_rows: Vec::new(),
             nvlink_rows: Vec::new(),
             xgmi_rows: Vec::new(),
@@ -550,6 +552,7 @@ impl App {
         detect_tabs(&mut self.seen_tabs, &self.throughputs);
 
         self.prev_taken_at = Some(snap.taken_at);
+        self.last_applied_at = Some(Instant::now());
         self.has_data = true;
 
         self.clamp_selection();
@@ -570,7 +573,7 @@ impl App {
     /// threshold (3x the refresh interval, min 2s); `None` while fresh.
     /// Lets the UI flag a stalled sampler, which `sampler_error` cannot see.
     pub fn stale_secs(&self) -> Option<u64> {
-        let at = self.prev_taken_at?;
+        let at = self.last_applied_at?;
         let threshold = (self.refresh_interval * 3).max(Duration::from_secs(2));
         let age = at.elapsed();
         (age > threshold).then_some(age.as_secs())
@@ -2432,5 +2435,13 @@ mod apply_snapshot_tests {
         app.apply_snapshot(gpu_snapshot(1_000_000_000, t0 + Duration::from_secs(2)));
         // 1e9 bytes * 8 / 2 s / 1e9 = 4.0 Gbps
         assert!((app.throughputs[0].tx_gbps - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slow_pass_is_not_stale_once_applied() {
+        let mut app = App::new();
+        let pass_started = Instant::now() - Duration::from_secs(4);
+        app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 0)], pass_started));
+        assert_eq!(app.stale_secs(), None);
     }
 }

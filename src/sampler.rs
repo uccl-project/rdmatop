@@ -34,7 +34,7 @@ pub struct Snapshot {
     pub nvlink: Option<Sample<Vec<nvlink::NvLinkSnapshot>>>,
     pub xgmi: Option<Sample<Vec<xgmi::XgmiSnapshot>>>,
     pub processes: Option<Vec<stat::ProcessRdmaInfo>>,
-    /// Pass start; used for the duplicate guard, staleness, and trace ts.
+    /// Pass start; used for the duplicate guard and trace ts.
     pub taken_at: Instant,
 }
 
