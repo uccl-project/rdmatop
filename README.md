@@ -63,11 +63,8 @@ rdmatop
 
 ## Perfetto recording
 
-Press `r` in the TUI to start recording and `r` again to stop. rdmatop captures
-every device's tx/rx Gbps and packets/s per interval and writes a Chrome-JSON
-trace (`rdmatop-<unix_timestamp>.json`, in the current directory) you can drag into [ui.perfetto.dev](https://ui.perfetto.dev)
-— each device/port becomes its own set of counter tracks. Timestamps are relative
-to when you pressed `r`, so the trace spans exactly your record window.
+Press `r` to start and stop recording. rdmatop writes `rdmatop-<timestamp>.json`
+to the current directory; open it in [ui.perfetto.dev](https://ui.perfetto.dev).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/uccl-project/rdmatop/main/images/perfetto.png" alt="rdmatop Perfetto recording" width="800">
@@ -75,14 +72,19 @@ to when you pressed `r`, so the trace spans exactly your record window.
 
 ## PyTorch profiler
 
-rdmatop can run inside the training process as a Kineto child profiler, so
-RDMA counter tracks land in the same trace `torch.profiler` writes:
+Build from a checkout (needs `cargo` and a C++ compiler; rebuild after
+upgrading torch):
+
+```bash
+pip install "setuptools>=77" "torch>=2.9"
+pip install --no-build-isolation -e .
+```
+
+Call `enable()` before profiling; RDMA counters land in the same trace:
 
 ```python
-import torch
-from torch.profiler import ProfilerActivity, profile
-
 import rdmatop.kineto
+from torch.profiler import ProfilerActivity, profile
 
 rdmatop.kineto.enable()
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
@@ -90,28 +92,16 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
 prof.export_chrome_trace("trace.json")
 ```
 
-The shim links against the installed torch (>= 2.9), so it is built from a
-checkout with `cargo` and a C++ compiler on `PATH`. PyTorch selects the required
-C++ standard (C++17 or C++20, depending on its version). Rebuild the shim after
-changing PyTorch versions:
-
-```bash
-pip install "setuptools>=77" "torch>=2.9"
-pip install --no-build-isolation -e .
-```
-
-On older Kineto versions without native counters, `enable()` wraps
-`torch.profiler.profile.export_chrome_trace()` to convert rdmatop's marked
-events into counter tracks. This also supports gzip exports and
-`tensorboard_trace_handler`; raw Kineto exports retain zero-duration events.
-Newer versions emit native counters and need no export wrapper.
-
 ## VizTracer
+
+Add RDMA counters to a VizTracer trace from the CLI:
 
 ```bash
 pip install "viztracer>=1.1.1"
 viztracer --plugins rdmatop.viztracer -- my_script.py
 ```
+
+Or in code:
 
 ```python
 from viztracer import VizTracer
@@ -119,6 +109,8 @@ from viztracer import VizTracer
 with VizTracer(plugins=["rdmatop.viztracer"], output_file="trace.json"):
     train_step()
 ```
+
+Set the sampling interval (ms, default 10) and limit to specific devices:
 
 ```bash
 viztracer --plugins "rdmatop.viztracer --interval 1 --devices mlx5_0,mlx5_1" -- my_script.py
