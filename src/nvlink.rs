@@ -16,18 +16,19 @@ use nvml_wrapper::structs::device::FieldId;
 use nvml_wrapper::Nvml;
 
 use nvml_wrapper_sys::bindings::field_id::{
-    NVML_FI_DEV_NVLINK_LINK_COUNT, NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L0, NVML_FI_DEV_NVLINK_SPEED_MBPS_L1,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L10, NVML_FI_DEV_NVLINK_SPEED_MBPS_L11,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L2, NVML_FI_DEV_NVLINK_SPEED_MBPS_L3,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L4, NVML_FI_DEV_NVLINK_SPEED_MBPS_L5,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L6, NVML_FI_DEV_NVLINK_SPEED_MBPS_L7,
-    NVML_FI_DEV_NVLINK_SPEED_MBPS_L8, NVML_FI_DEV_NVLINK_SPEED_MBPS_L9,
-    NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX, NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX,
+    NVML_FI_DEV_NVLINK_GET_SPEED, NVML_FI_DEV_NVLINK_LINK_COUNT,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON, NVML_FI_DEV_NVLINK_SPEED_MBPS_L0,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L1, NVML_FI_DEV_NVLINK_SPEED_MBPS_L10,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L11, NVML_FI_DEV_NVLINK_SPEED_MBPS_L2,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L3, NVML_FI_DEV_NVLINK_SPEED_MBPS_L4,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L5, NVML_FI_DEV_NVLINK_SPEED_MBPS_L6,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L7, NVML_FI_DEV_NVLINK_SPEED_MBPS_L8,
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_L9, NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX,
+    NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX,
 };
 use nvml_wrapper_sys::bindings::{
-    nvmlFieldValue_st, nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_LONG_LONG, nvmlValue_t,
-    NVML_NVLINK_MAX_LINKS,
+    nvmlFieldValue_st, nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_INT,
+    nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_LONG_LONG, nvmlValue_t, NVML_NVLINK_MAX_LINKS,
 };
 
 /// Logical classification of the device on the other end of an NVLink.
@@ -70,7 +71,7 @@ pub struct LinkSnapshot {
     pub is_active: bool,
     /// NVLink protocol version reported by the driver.
     pub version: Option<u32>,
-    /// Negotiated per-link speed in Gbps (Mb/s / 1000). `None` if unknown.
+    /// Negotiated per-link speed in Gbps (MB/s * 8 / 1000). `None` if unknown.
     /// Aggregated into `NvLinkSnapshot::link_gbps` for the GPU-wide total;
     /// not directly read by the TUI.
     #[allow(dead_code)]
@@ -114,7 +115,7 @@ fn link_meta(
         version: nvlink.version().ok(),
         remote_device_type: read_remote_device_type(nvml, device, link_id),
         remote_pci_bdf: nvlink.remote_pci_info().ok().map(|p| p.bus_id),
-        speed_gbps: read_link_speed_gbps(device, link_id).or(common_speed_gbps),
+        speed_gbps: read_link_speed_gbps(nvml, device, link_id).or(common_speed_gbps),
     };
     // Cache only fully-resolved replies: a partial answer during link
     // training (e.g. version ok, speed still 0) must retry next poll, or
@@ -327,24 +328,37 @@ fn read_common_speed_gbps(device: &nvml_wrapper::Device<'_>) -> Option<f64> {
     if mbps == 0 {
         None
     } else {
-        // NVML reports Mb/s (megabits/sec) for this field; convert to Gb/s.
-        Some(mbps as f64 / 1000.0)
+        // NVML reports MB/s (megabytes/sec); convert to Gb/s.
+        Some(mbps as f64 * 8.0 / 1000.0)
     }
 }
 
-fn read_link_speed_gbps(device: &nvml_wrapper::Device<'_>, link: u32) -> Option<f64> {
+fn read_link_speed_gbps(nvml: &Nvml, device: &nvml_wrapper::Device<'_>, link: u32) -> Option<f64> {
+    let mut field = make_field(NVML_FI_DEV_NVLINK_GET_SPEED, link);
+    let rc = unsafe {
+        nvml.lib()
+            .nvmlDeviceGetFieldValues(device.handle(), 1, &mut field)
+    };
+    if rc == 0
+        && field.nvmlReturn == 0
+        && field.valueType == nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_INT
+    {
+        let mbps = unsafe { field.value.uiVal };
+        return (mbps > 0).then_some(mbps as f64 * 8.0 / 1000.0);
+    }
+
     let field_id = *LINK_SPEED_FIELD_IDS.get(link as usize)?;
     let mbps = read_field_u32(device, field_id)?;
     if mbps == 0 {
         None
     } else {
-        // NVML reports Mb/s (megabits/sec); convert to Gb/s.
-        Some(mbps as f64 / 1000.0)
+        // NVML reports MB/s (megabytes/sec); convert to Gb/s.
+        Some(mbps as f64 * 8.0 / 1000.0)
     }
 }
 
 /// Query per-link TX/RX throughput via raw `nvmlDeviceGetFieldValues`.
-/// `scopeId` is set to the per-link id as required by the plan.
+/// `scopeId` selects a link; UINT_MAX selects the GPU aggregate.
 fn read_link_throughput(
     nvml: &Nvml,
     device: &nvml_wrapper::Device<'_>,
@@ -370,12 +384,6 @@ fn read_link_throughput(
     tx = fields[0];
     rx = fields[1];
 
-    // NVML does not actually let you scope these throughput counters to a
-    // single link via `scopeId`; the driver always reports the per-GPU
-    // aggregate. The values below therefore represent the GPU aggregate
-    // rather than the per-link bytes. Per-link attribution would require a
-    // future NVML field; until then we return whatever NVML gives us so the
-    // TUI can at least show a non-zero value when traffic is flowing.
     let tx_bytes = if tx.nvmlReturn == 0
         && tx.valueType == nvmlValueType_enum_NVML_VALUE_TYPE_UNSIGNED_LONG_LONG
     {
@@ -426,6 +434,28 @@ fn read_remote_device_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and nvidia-smi"]
+    fn link_speed_matches_nvidia_smi() {
+        let output = std::process::Command::new("nvidia-smi")
+            .args(["nvlink", "-s", "-i", "0"])
+            .output()
+            .expect("run nvidia-smi");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let speed_line = stdout
+            .lines()
+            .find(|line| line.contains("Link 0:"))
+            .unwrap();
+        let (_, speed) = speed_line.split_once(':').unwrap();
+        let mut parts = speed.split_whitespace();
+        let speed_gb_s: f64 = parts.next().unwrap().parse().unwrap();
+        assert_eq!(parts.next(), Some("GB/s"));
+        let snapshots = read_all_nvlink_stats().unwrap();
+        let gpu = snapshots.iter().find(|gpu| gpu.gpu_index == 0).unwrap();
+        assert_eq!(gpu.links[0].speed_gbps, Some(speed_gb_s * 8.0));
+    }
 
     #[test]
     fn remote_device_type_label() {
