@@ -113,6 +113,16 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
     let n = display.len();
     let total_tx: f64 = display.iter().map(|t| t.tx_gbps).sum();
     let total_rx: f64 = display.iter().map(|t| t.rx_gbps).sum();
+    let tx_partial = display
+        .iter()
+        .filter_map(|row| row.nvlink.as_ref())
+        .any(|meta| meta.tx_partial);
+    let rx_partial = display
+        .iter()
+        .filter_map(|row| row.nvlink.as_ref())
+        .any(|meta| meta.rx_partial);
+    let tx_prefix = if tx_partial { ">=" } else { "" };
+    let rx_prefix = if rx_partial { ">=" } else { "" };
     let total_drops: f64 = display.iter().map(|t| t.rx_drops_per_sec).sum();
     let drop_color = if total_drops > 0.0 {
         tc.error
@@ -145,9 +155,17 @@ fn header_line2(app: &App, tc: &ThemeColors) -> Line<'static> {
             false,
         ),
         styled(" │ TX: ", tc.muted, false),
-        styled(&format!("{:.2} Gbps", total_tx), tc.good, false),
+        styled(
+            &format!("{}{:.2} Gbps", tx_prefix, total_tx),
+            tc.good,
+            false,
+        ),
         styled(" │ RX: ", tc.muted, false),
-        styled(&format!("{:.2} Gbps", total_rx), tc.good, false),
+        styled(
+            &format!("{}{:.2} Gbps", rx_prefix, total_rx),
+            tc.good,
+            false,
+        ),
         styled(" │ Drops: ", tc.muted, false),
         styled(&format!("{:.0}/s", total_drops), drop_color, false),
         styled(&status, tc.muted, false),
@@ -431,12 +449,29 @@ fn gpu_errs(t: &PortThroughput) -> String {
     if t.xgmi.is_some() {
         return format!("{}/{}", counter("xgmi_wafl_ce"), counter("xgmi_wafl_ue"));
     }
-    let sum: u64 = t
+    let mut active_links = t
+        .nvlink
+        .iter()
+        .flat_map(|meta| &meta.links)
+        .filter(|link| link.is_active);
+    let missing_errors = active_links.any(|link| {
+        link.crc_error_count.is_none()
+            || link.replay_error_count.is_none()
+            || link.recovery_error_count.is_none()
+    });
+    if missing_errors {
+        return "N/A".to_string();
+    }
+    let mut errors = t
         .counter_rates
         .iter()
-        .filter(|c| c.name.starts_with("nvlink_"))
-        .map(|c| c.value)
-        .sum();
+        .filter(|c| c.name.starts_with("nvlink_"));
+    let Some(first) = errors.next() else {
+        return "N/A".to_string();
+    };
+    let sum = errors
+        .map(|counter| counter.value)
+        .fold(first.value, u64::saturating_add);
     sum.to_string()
 }
 
@@ -447,6 +482,10 @@ fn gpu_metrics(t: &PortThroughput) -> Option<&GpuMetrics> {
 }
 
 fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors, widths: &[u16; 12]) -> Vec<Cell<'static>> {
+    let tx_partial = t.nvlink.as_ref().is_some_and(|meta| meta.tx_partial);
+    let rx_partial = t.nvlink.as_ref().is_some_and(|meta| meta.rx_partial);
+    let tx_prefix = if tx_partial { ">=" } else { "" };
+    let rx_prefix = if rx_partial { ">=" } else { "" };
     let m = gpu_metrics(t);
     let util = m.and_then(|m| m.util_pct);
     let mem = m.and_then(|m| match (m.vram_used_mb, m.vram_total_mb) {
@@ -483,18 +522,12 @@ fn gpu_row_cells(t: &PortThroughput, tc: &ThemeColors, widths: &[u16; 12]) -> Ve
         pwr_cell,
         Cell::from(gbps_bar(t.tx_gbps, t.link_gbps, widths[6] as usize))
             .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
-        Cell::from(format!("{:.2}", t.tx_gbps)).style(Style::default().fg(throughput_color(
-            t.tx_gbps,
-            t.link_gbps,
-            tc,
-        ))),
+        Cell::from(format!("{}{:.2}", tx_prefix, t.tx_gbps))
+            .style(Style::default().fg(throughput_color(t.tx_gbps, t.link_gbps, tc))),
         Cell::from(gbps_bar(t.rx_gbps, t.link_gbps, widths[8] as usize))
             .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
-        Cell::from(format!("{:.2}", t.rx_gbps)).style(Style::default().fg(throughput_color(
-            t.rx_gbps,
-            t.link_gbps,
-            tc,
-        ))),
+        Cell::from(format!("{}{:.2}", rx_prefix, t.rx_gbps))
+            .style(Style::default().fg(throughput_color(t.rx_gbps, t.link_gbps, tc))),
         Cell::from(t.port_label.clone().unwrap_or_default()).style(Style::default().fg(tc.fg)),
         Cell::from(gpu_errs(t)).style(Style::default().fg(tc.warning)),
     ]
@@ -876,6 +909,8 @@ fn build_nvlink_detail_lines(
     show_avg: bool,
     avg_window: usize,
 ) -> Vec<Line<'static>> {
+    let tx_prefix = if meta.tx_partial { ">=" } else { "" };
+    let rx_prefix = if meta.rx_partial { ">=" } else { "" };
     let spark_w = 30;
     let (tx_spark, rx_spark) = match history {
         Some(h) => (sparkline_str(&h.tx, spark_w), sparkline_str(&h.rx, spark_w)),
@@ -905,14 +940,22 @@ fn build_nvlink_detail_lines(
     // Aggregate TX line with sparkline.
     lines.push(Line::from(vec![
         styled(" TX: ", tc.muted, false),
-        styled(&format!("{:.2} Gbps ", t.tx_gbps), tc.good, false),
+        styled(
+            &format!("{}{:.2} Gbps ", tx_prefix, t.tx_gbps),
+            tc.good,
+            false,
+        ),
         styled(&tx_spark, tc.good, false),
     ]));
 
     // Aggregate RX line with sparkline.
     lines.push(Line::from(vec![
         styled(" RX: ", tc.muted, false),
-        styled(&format!("{:.2} Gbps ", t.rx_gbps), tc.accent, false),
+        styled(
+            &format!("{}{:.2} Gbps ", rx_prefix, t.rx_gbps),
+            tc.accent,
+            false,
+        ),
         styled(&rx_spark, tc.accent, false),
     ]));
 
@@ -920,10 +963,8 @@ fn build_nvlink_detail_lines(
 
     lines.push(Line::from(""));
 
-    // Muted note explaining that the per-lane TX/RX columns below show the
-    // GPU-wide aggregate, since NVML does not expose per-lane throughput.
     lines.push(Line::from(styled(
-        " Per-lane throughput is not available from NVML on some drivers; values below show either per-lane rate or the GPU aggregate.",
+        " Per-link TX/RX; N/A = unavailable; >= = partial GPU total.",
         tc.muted,
         false,
     )));
@@ -935,17 +976,15 @@ fn build_nvlink_detail_lines(
         true,
     )]));
 
-    // One row per link (active + inactive). Render per-lane throughput if available,
-    // otherwise fallback to the GPU aggregate rate (converted from Gbps to MB/s).
     for link in &meta.links {
-        let link_tx_mb_s = match link.tx_bytes {
-            Some(bytes) => bytes as f64 / 1_000_000.0,
-            None => t.tx_gbps * 1000.0 / 8.0,
-        };
-        let link_rx_mb_s = match link.rx_bytes {
-            Some(bytes) => bytes as f64 / 1_000_000.0,
-            None => t.rx_gbps * 1000.0 / 8.0,
-        };
+        let link_tx_mb_s = link
+            .tx_bytes
+            .map(|bytes| format!("{:.1}", bytes as f64 / 1_000_000.0))
+            .unwrap_or_else(|| "N/A".to_string());
+        let link_rx_mb_s = link
+            .rx_bytes
+            .map(|bytes| format!("{:.1}", bytes as f64 / 1_000_000.0))
+            .unwrap_or_else(|| "N/A".to_string());
 
         let state_label = if link.is_active {
             "enabled"
@@ -957,7 +996,11 @@ fn build_nvlink_detail_lines(
             .version
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let remote_label = match (&link.remote_pci_bdf, &link.remote_device_type) {
+        let remote_bdf = link
+            .remote_pci_bdf
+            .as_deref()
+            .filter(|bdf| !bdf.eq_ignore_ascii_case("FFFFFFFF:FF:FF.0"));
+        let remote_label = match (remote_bdf, &link.remote_device_type) {
             (Some(bdf), ty) => format!("{} {}", ty.label(), bdf),
             (None, ty) => match ty {
                 crate::nvlink::RemoteDeviceType::Unknown => "-".to_string(),
@@ -968,23 +1011,44 @@ fn build_nvlink_detail_lines(
             styled(&format!(" {:>4}", link.link_id), tc.accent, false),
             styled(&format!("  {:<8}", state_label), state_color, false),
             styled(&format!("  {:>3}", ver_label), tc.fg, false),
-            styled(&format!("  {:>6.1}", link_tx_mb_s), tc.fg, false),
-            styled(&format!("  {:>6.1}", link_rx_mb_s), tc.fg, false),
+            styled(&format!("  {:>7}", link_tx_mb_s), tc.fg, false),
+            styled(&format!("  {:>7}", link_rx_mb_s), tc.fg, false),
             styled(&format!("  {}", remote_label), tc.muted, false),
         ]));
     }
 
     lines.push(Line::from(""));
 
-    // Errors line: sum per-link counters across all lanes. None -> 0.
-    let mut crc: u64 = 0;
-    let mut replay: u64 = 0;
-    let mut recovery: u64 = 0;
-    for link in &meta.links {
-        crc = crc.saturating_add(link.crc_error_count.unwrap_or(0));
-        replay = replay.saturating_add(link.replay_error_count.unwrap_or(0));
-        recovery = recovery.saturating_add(link.recovery_error_count.unwrap_or(0));
-    }
+    let crc = meta
+        .links
+        .iter()
+        .filter(|link| link.is_active || link.crc_error_count.is_some())
+        .map(|link| link.crc_error_count)
+        .reduce(|sum, value| Some(sum?.saturating_add(value?)))
+        .flatten();
+    let replay = meta
+        .links
+        .iter()
+        .filter(|link| link.is_active || link.replay_error_count.is_some())
+        .map(|link| link.replay_error_count)
+        .reduce(|sum, value| Some(sum?.saturating_add(value?)))
+        .flatten();
+    let recovery = meta
+        .links
+        .iter()
+        .filter(|link| link.is_active || link.recovery_error_count.is_some())
+        .map(|link| link.recovery_error_count)
+        .reduce(|sum, value| Some(sum?.saturating_add(value?)))
+        .flatten();
+    let crc = crc
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+    let replay = replay
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+    let recovery = recovery
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
     lines.push(Line::from(vec![
         styled(" Errors: ", tc.muted, false),
         styled(&format!("replay={}", replay), tc.warning, false),
@@ -1762,6 +1826,8 @@ mod nvlink_detail_tests {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
             active_links: active,
+            tx_partial: false,
+            rx_partial: false,
             links: links.clone(),
             metrics: None,
         };
@@ -1917,6 +1983,86 @@ mod nvlink_detail_tests {
     }
 
     #[test]
+    fn unavailable_remote_address_and_errors_are_not_reported_as_valid() {
+        let link = make_link(
+            0,
+            true,
+            RemoteDeviceType::Switch,
+            Some("FFFFFFFF:FF:FF.0"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(7),
+        );
+        let (port, meta) = make_port("nvidia0", vec![link], 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let blob = join_lines(&lines);
+        assert!(blob.contains("NVSwitch"));
+        assert!(!blob.contains("FFFFFFFF"));
+        assert!(blob.contains("replay=N/A"));
+        assert!(blob.contains("recovery=N/A"));
+        assert!(blob.contains("crc=N/A"));
+    }
+
+    #[test]
+    fn partial_error_readings_do_not_report_a_complete_zero_total() {
+        let known = make_link(
+            0,
+            true,
+            RemoteDeviceType::Switch,
+            None,
+            None,
+            None,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(7),
+        );
+        let mut unknown = known.clone();
+        unknown.link_id = 1;
+        unknown.crc_error_count = None;
+        let (port, meta) = make_port("nvidia0", vec![known, unknown], 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let blob = join_lines(&lines);
+        assert!(blob.contains("replay=0"));
+        assert!(blob.contains("recovery=0"));
+        assert!(blob.contains("crc=N/A"));
+        assert_eq!(gpu_errs(&port), "N/A");
+    }
+
+    #[test]
+    fn disabled_link_errors_remain_visible_in_detail() {
+        let active = make_link(
+            0,
+            true,
+            RemoteDeviceType::Switch,
+            None,
+            None,
+            None,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(7),
+        );
+        let mut disabled = active.clone();
+        disabled.link_id = 1;
+        disabled.is_active = false;
+        disabled.replay_error_count = Some(5);
+        let (port, meta) = make_port("nvidia0", vec![active, disabled], 0.0, 0.0);
+        let tc = Theme::Default.colors();
+        let lines = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        let blob = join_lines(&lines);
+        assert!(
+            blob.contains("replay=5"),
+            "disabled-link errors were lost: {blob}"
+        );
+    }
+
+    #[test]
     fn error_line_sums_counters_across_links() {
         let links = vec![
             make_link(
@@ -2006,10 +2152,39 @@ mod nvlink_detail_tests {
     }
 
     #[test]
-    fn header_and_lanes_show_aggregate_rates() {
-        // Two active links and one inactive link. The aggregate must appear
-        // in the header (in Gbps) and be repeated identically in every lane
-        // row (in MB/s) — NVML does not expose per-lane throughput.
+    fn partial_gpu_total_is_labeled_in_header_table_and_detail() {
+        let (mut port, mut meta) = make_port("nvidia0", Vec::new(), 0.0, 0.0);
+        meta.tx_partial = true;
+        port.tx_gbps = 1.0;
+        port.rx_gbps = 2.0;
+        port.nvlink = Some(meta.clone());
+        let tc = Theme::Default.colors();
+        let detail = build_nvlink_detail_lines(&port, &meta, None, &tc, false, 0);
+        assert!(detail[1].to_string().contains(">=1.00 Gbps"));
+        assert!(detail[2].to_string().contains("2.00 Gbps"));
+        assert!(!detail[2].to_string().contains(">="));
+
+        let widths = [12; 12];
+        let cells = gpu_row_cells(&port, &tc, &widths);
+        let row = Row::new(cells);
+        let table = Table::new([row], [Constraint::Length(12); 12]);
+        let area = Rect::new(0, 0, 156, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(table, buffer.area, &mut buffer);
+        let symbols: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(symbols.contains(">=1.00"));
+
+        let mut app = App::new();
+        app.seen_tabs = vec![DeviceClass::Rdma, DeviceClass::Nvlink];
+        app.throughputs = vec![port];
+        app.cycle_tab(true);
+        let header = header_line2(&app, &tc).to_string();
+        assert!(header.contains("TX: >=1.00 Gbps"));
+        assert!(header.contains("RX: 2.00 Gbps"));
+    }
+
+    #[test]
+    fn missing_lane_rates_do_not_repeat_gpu_aggregate() {
         let links = vec![
             make_link(
                 0,
@@ -2054,6 +2229,8 @@ mod nvlink_detail_tests {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
             active_links: 2,
+            tx_partial: false,
+            rx_partial: false,
             links: links.clone(),
             metrics: None,
         };
@@ -2089,48 +2266,16 @@ mod nvlink_detail_tests {
             "RX header missing aggregate rate: {rx_line:?}"
         );
 
-        // Compute the expected MB/s value: gbps * 1000 / 8 = 125.0.
-        let expected_mb_s = "125.0";
-
-        // Muted note line must be present before the lane table.
-        let blob = join_lines(&lines);
-        assert!(
-            blob.contains("Per-lane throughput is not available from NVML"),
-            "missing muted note about per-lane throughput: {blob}"
-        );
-
-        // Each lane row must contain the aggregate MB/s value. Look up rows
-        // by their link id and verify both TX and RX columns render 125.0.
-        for link in &links {
-            let lane_row = lines
-                .iter()
-                .find(|l| {
-                    let s = l.to_string();
-                    s.contains(&format!("{:>4}", link.link_id))
-                })
-                .unwrap_or_else(|| panic!("missing lane row for link {}", link.link_id))
-                .to_string();
-            // The MB/s value is rendered as `{:>6.1}` so it appears as
-            // " 125.0" (leading space from the width spec).
-            assert!(
-                lane_row.contains(&expected_mb_s.to_string()),
-                "lane {} row missing aggregate MB/s value {}: {:?}",
-                link.link_id,
-                expected_mb_s,
-                lane_row
-            );
-        }
-
-        // The MB/s value must appear in every lane row — that's three
-        // occurrences total (one per link).
-        let occurrences = lines
+        let lane_rows: Vec<String> = lines
             .iter()
-            .filter(|l| l.to_string().contains(expected_mb_s))
-            .count();
-        assert_eq!(
-            occurrences, 3,
-            "expected the aggregate MB/s value in 3 lane rows, got {occurrences}"
-        );
+            .map(|line| line.to_string())
+            .filter(|line| line.contains("enabled") || line.contains("disabled"))
+            .collect();
+        assert_eq!(lane_rows.len(), 3);
+        assert!(lane_rows
+            .iter()
+            .all(|line| line.matches("N/A").count() == 2));
+        assert!(lane_rows.iter().all(|line| !line.contains("125.0")));
     }
 
     #[test]
@@ -2165,6 +2310,8 @@ mod nvlink_detail_tests {
             gpu_index: 0,
             gpu_name: "H100".to_string(),
             active_links: 2,
+            tx_partial: false,
+            rx_partial: false,
             links: links.clone(),
             metrics: None,
         };
@@ -2417,6 +2564,8 @@ mod gpu_table_tests {
                 gpu_index: 0,
                 gpu_name: "H100".to_string(),
                 active_links: 18,
+                tx_partial: false,
+                rx_partial: false,
                 links: vec![],
                 metrics: None,
             }),
@@ -2480,7 +2629,7 @@ mod gpu_table_tests {
     fn gpu_errs_nvlink_missing_counters() {
         let mut row = nvlink_row(0, 0);
         row.counter_rates.clear();
-        assert_eq!(gpu_errs(&row), "0");
+        assert_eq!(gpu_errs(&row), "N/A");
     }
 }
 
