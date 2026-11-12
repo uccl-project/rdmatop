@@ -21,6 +21,11 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
             handle_column_picker(app, key.code);
             return Ok(true);
         }
+        // Node picker takes priority (multi-node mode)
+        if app.show_node_picker {
+            handle_node_picker(app, key.code);
+            return Ok(true);
+        }
         // Help toggle from any mode
         if key.code == KeyCode::Char('h') {
             app.show_help = !app.show_help;
@@ -35,6 +40,8 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
         }
         if app.show_detail {
             handle_detail_mode(app, key.code);
+        } else if app.multi && app.view_all {
+            handle_all_mode(app, key.code);
         } else {
             handle_normal_mode(app, key.code);
         }
@@ -45,7 +52,14 @@ pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
 
 fn handle_normal_mode(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => {
+            if app.multi {
+                app.exit_to_all();
+            } else {
+                app.should_quit = true;
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Left => app.scroll_left(),
@@ -62,6 +76,35 @@ fn handle_normal_mode(app: &mut App, key: KeyCode) {
         KeyCode::Char('w') => app.open_window_input(),
         KeyCode::Char('c') => app.open_column_picker(),
         KeyCode::Char('r') => app.toggle_recording(),
+        KeyCode::Char('n') if app.multi => app.toggle_node_picker(),
+        KeyCode::Char(c) if app.multi && c.is_ascii_digit() => {
+            // 1..9 jump to node n-1; 0 jumps to the last node.
+            let idx = if c == '0' {
+                app.node_names.len().saturating_sub(1)
+            } else {
+                (c as u8 - b'1') as usize
+            };
+            if idx < app.node_names.len() {
+                app.enter_node(idx);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_all_mode(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Up | KeyCode::Char('k') => app.all_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.all_down(),
+        KeyCode::Enter => app.enter_selected_node(),
+        KeyCode::Char('t') => app.cycle_theme(),
+        KeyCode::Tab => app.cycle_tab(true),
+        KeyCode::BackTab => app.cycle_tab(false),
+        KeyCode::Char('>') => app.increase_refresh_interval(),
+        KeyCode::Char('<') => app.decrease_refresh_interval(),
+        KeyCode::Char('n') => app.toggle_node_picker(),
+        KeyCode::Char('e') => app.toggle_errors_only(),
         _ => {}
     }
 }
@@ -107,6 +150,20 @@ fn handle_column_picker(app: &mut App, key: KeyCode) {
         KeyCode::Up | KeyCode::Char('k') => app.column_picker_up(),
         KeyCode::Down | KeyCode::Char('j') => app.column_picker_down(),
         KeyCode::Char(' ') | KeyCode::Enter => app.column_picker_toggle(),
+        _ => {}
+    }
+}
+
+fn handle_node_picker(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('n') => app.close_node_picker(),
+        KeyCode::Up | KeyCode::Char('k') => app.node_picker_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.node_picker_down(),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let idx = app.node_picker_cursor;
+            app.close_node_picker();
+            app.enter_node(idx);
+        }
         _ => {}
     }
 }

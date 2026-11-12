@@ -185,6 +185,9 @@ pub const HELP: &str = "\
 Usage: rdmatop
        rdmatop --format csv --output PATH --device NAME [--port N]
                [--interval MS] [--duration SECONDS]
+       rdmatop --agent [--listen ADDR] [--name NAME] [--token-file F] [--stdio]
+       rdmatop --connect HOST:PORT
+       rdmatop --nodes SPEC
 
 Record cumulative RDMA counters without the TUI or GPU/process scans.
 Command-line recording supports CSV. Press r in the TUI for a Perfetto trace.
@@ -194,6 +197,14 @@ Driver latency limits the achieved rate.
 CSV poll_start_ns/poll_end_ns use CLOCK_MONOTONIC on this host.
 The output file must not already exist. Run one recorder per port to
 sample ports independently. Duration must be positive.
+
+--agent serves this host's snapshots over TCP (default 127.0.0.1:7809;
+--stdio serves one viewer over stdin/stdout for SSH transport).
+--connect attaches a smoke-test viewer to an agent and prints frames.
+--nodes SPEC runs the multi-node TUI: SPEC is a comma-separated list of
+host:port entries (optionally name=host:port), or @file with one per
+line. The ALL view aggregates every node; Enter drills into a node,
+Esc returns to ALL, n opens the node picker.
 ";
 
 pub struct Options {

@@ -61,6 +61,153 @@ make install # cargo install
 rdmatop
 ```
 
+## Distributed monitoring
+
+Monitor a whole cluster from one terminal: `htop` for every RDMA fabric
+you own. Each monitored node runs an **agent**; a **viewer** aggregates
+them into an ALL view and drills into any node — the drill-in is the
+exact same UI as single-node rdmatop, so muscle memory carries over.
+
+```
+viewer (your workstation)                    agents (every node)
+  rdmatop --nodes node1:7809,node2:7809  ──▶  rdmatop --agent --listen 0.0.0.0:7809
+    ├── ALL view: one row per node
+    └── Enter: drill into a node's
+        per-port / per-process detail
+```
+
+### Starting the agents
+
+```bash
+# On every monitored node. --listen is REQUIRED for cross-host access:
+# the default binds 127.0.0.1 only.
+rdmatop --agent --listen 0.0.0.0:7809 --name gpu-node3
+```
+
+| Flag | Meaning |
+|---|---|
+| `--listen ADDR` | Bind address. Default `127.0.0.1:7809` (loopback only). |
+| `--name NAME` | Display name (defaults to the hostname). |
+| `--token-file F` | Shared secret; handshake is compared in constant time. |
+| `--stdio` | Serve one viewer over stdin/stdout (SSH transport, no port). |
+
+The agent prints its identity at startup, so a cluster logs which build
+each node runs:
+
+```
+rdmatop agent 0.1.33 (v0.1.33-11-g803ea18) listening on 0.0.0.0:7809 (name: gpu-node3)
+```
+
+A systemd unit for every node:
+
+```ini
+[Unit]
+Description=rdmatop RDMA agent
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/rdmatop --agent --listen 0.0.0.0:7809 --name %H
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Starting the viewer
+
+```bash
+# Comma-separated host:port; name=host:port renames a node.
+rdmatop --nodes gpu-node1:7809,gpu-node2:7809,storage-01=10.0.0.9:7809
+
+# Or one per line from a file (# comments allowed).
+rdmatop --nodes @cluster.txt
+```
+
+Addresses must resolve — a placeholder that does not reach an agent
+shows as DISCONNECTED rather than silently displaying the wrong host. The
+local node is always row 0, so the viewer host is monitored alongside the
+remotes.
+
+### The ALL view
+
+```
+NODE              TX Gbps  RX Gbps  PORTS  PROCS    ERR/s  CONG/s  STATUS
+▶ gpu-node1          97.8      0.0    8/9      4        0       -  LIVE
+  gpu-node2          31.1      0.0    8/9      2    388 OB     4.9  LIVE
+  gpu-node3           0.0      2.4    8/9      2      0        -  STALE 7s
+  gpu-node4            -        -      -       -      0        -  DISCONNECTED
+```
+
+- **ERR/s** — hard error counters per second (`out_of_buffer`, RNR
+  retries, CQE errors, drops, retransmit timeouts, ...), red, suffixed
+  with the dominant counter's abbreviation (`OB`, `RNR`, `CQE`, ...)
+  so the failure mode is readable without drilling in.
+- **CONG/s** — congestion signals per second (ECN marks, CNPs). Yellow
+  and advisory: a busy fabric is not a failure.
+- Ports `active/total`, process count, and link state per node.
+- Rows sort by TX; `e` filters to unhealthy nodes only (errors, stale, or
+  disconnected) — the workflow that matters at scale.
+
+### Keys in multi-node mode
+
+| Key | Effect |
+|---|---|
+| `Enter` (ALL) | Drill into the selected node |
+| `Esc` (node) | Back to the ALL view |
+| `n` | Node picker |
+| `e` (ALL) | Show only unhealthy nodes |
+| `1..9` / `0` | Jump to node N / the last node |
+| `Tab` | Switch the aggregated device class (RDMA / XGMI / NVLink) |
+| `r` | Record a Perfetto trace |
+
+The drill-in header leads with the node's name and hostname
+(`gpu-node3 (gpu-node3.cluster)`), so you can always tell which node the
+screen is bound to. A node that disconnects keeps its last values dimmed
+and reconnects automatically with capped backoff.
+
+### Protocol
+
+JSON lines over TCP. The viewer opens with a handshake
+(`{"v":1,"interval_ms":1000}`), then the agent sends one snapshot per
+interval:
+
+```json
+{"t":"snap","mono_ns":1043,"sys":{...},"stats":{...},"ifstats":{...},
+ "nvlink":{...},"xgmi":{...},"procs":[...]}
+```
+
+Timestamps are monotonic nanoseconds, so rate math is immune to clock
+skew between hosts; the agent is a dumb forwarder of raw counters and all
+rates are computed in the viewer. A stalled agent streams
+`{"t":"ping"}` keepalives so the viewer reports honest STALE data
+instead of flapping the connection.
+
+**Security:** agents default to loopback; `--listen 0.0.0.0` is an
+explicit opt-in. Use `--token-file` for a shared secret and keep the
+fabric on a trusted network — there is no TLS yet. `--agent --stdio`
+serves one viewer over stdin/stdout, which is how the SSH transport
+(planned) reaches hosts without opening ports.
+
+### Recording across nodes
+
+`r` in a node view writes a Perfetto trace with device names prefixed by
+the node (`gpu-node3/mlx5_0`), so multi-node traces remain
+distinguishable in [ui.perfetto.dev](https://ui.perfetto.dev).
+
+### Scaling notes
+
+Memory per monitored node is roughly 30–80 KB (more for GPU nodes, whose
+NVLink/XGMI snapshots dominate); a thousand agents fit in a few hundred
+MB. The limits you will actually hit first:
+
+- **File descriptors** — one socket per node. Raise `ulimit -n` (or
+  systemd `LimitNOFILE`) for hundreds of agents.
+- **Sampling cost** — the agent's `collect()` walks every NIC, QP table,
+  and GPU serially. Many-NIC, busy-node hosts therefore refresh slower
+  than the requested interval; the viewer shows that honestly as STALE.
+- **ALL-view usability** — beyond a few hundred nodes use `e` to filter
+  and `@cluster.txt` to manage the list.
+
 ## Perfetto recording
 
 Press `r` to start and stop recording. rdmatop writes `rdmatop-<timestamp>.json`

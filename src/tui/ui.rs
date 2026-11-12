@@ -30,6 +30,15 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("q", "Quit"),
 ];
 
+/// Extra help rows shown only in multi-node mode.
+const MULTI_HELP_KEYS: &[(&str, &str)] = &[
+    ("Enter (ALL)", "Drill into the selected node"),
+    ("Esc (node)", "Back to the ALL view"),
+    ("n", "Node picker"),
+    ("e (ALL)", "Show only unhealthy nodes (errors/stale/down)"),
+    ("1..9 / 0", "Jump to node N (0 = last)"),
+];
+
 const RDMA_LINK_GBPS: f64 = 100.0;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -71,7 +80,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.show_help {
-        draw_help_popup(frame, &tc);
+        draw_help_popup(frame, app, &tc);
     }
     if app.show_window_input {
         draw_window_input_popup(frame, app, &tc);
@@ -79,9 +88,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_column_picker {
         draw_column_picker(frame, app, &tc);
     }
+    if app.show_node_picker {
+        draw_node_picker(frame, app, &tc);
+    }
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
+    if app.multi && app.view_all {
+        draw_all_view(frame, app, area, tc);
+        return;
+    }
     if app.show_detail {
         let split = Layout::default()
             .direction(Direction::Horizontal)
@@ -95,12 +111,21 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 }
 
 fn header_line1(app: &App, tc: &ThemeColors) -> Line<'static> {
+    // In multi-node mode, lead with the view identity so the operator can
+    // never mistake which node they are looking at.
+    let sys = app.view_sysinfo();
+    let label = app.view_label();
+    let who = if label.is_empty() {
+        sys.hostname.clone()
+    } else {
+        format!("{label} ({})", sys.hostname)
+    };
     Line::from(vec![
         styled(" rdmatop ", tc.accent, true),
         styled(
             &format!(
                 "- {} │ {} │ load average: {}",
-                app.sysinfo.hostname, app.sysinfo.uptime, app.sysinfo.load_avg
+                who, sys.uptime, sys.load_avg
             ),
             tc.muted,
             false,
@@ -215,7 +240,7 @@ fn mem_bar(used: u64, total: u64, pct: f32, width: usize, tc: &ThemeColors) -> V
 }
 
 fn header_line3(app: &App, tc: &ThemeColors) -> Line<'static> {
-    let s = &app.sysinfo;
+    let s = app.view_sysinfo();
     let mut spans = vec![styled(" CPU ", tc.muted, false)];
     spans.extend(cpu_bar(s.cpu_pct, 20, tc));
     spans.push(styled("  Mem ", tc.muted, false));
@@ -574,7 +599,7 @@ fn draw_gpu_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors
     };
 
     // Before the first background-sampler snapshot arrives, show a placeholder.
-    if display.is_empty() && !app.has_data {
+    if display.is_empty() && !app.view_has_data() {
         draw_startup_placeholder(frame, app, area, tc, title);
         return;
     }
@@ -660,7 +685,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     };
 
     // Before the first background-sampler snapshot arrives, show a placeholder.
-    if display.is_empty() && !app.has_data {
+    if display.is_empty() && !app.view_has_data() {
         draw_startup_placeholder(frame, app, area, tc, title);
         return;
     }
@@ -1319,7 +1344,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         }
     };
 
-    let history = app.history.get(&t.dev_name);
+    let history = app.view_history().get(&t.dev_name);
     let procs = app.selected_device_processes();
 
     let lines = build_selected_detail_lines(
@@ -1443,21 +1468,25 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_help_popup(frame: &mut Frame, tc: &ThemeColors) {
+fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
     // Size the popup to the longest row (16-char key column + description)
     // plus borders, so nothing gets clipped.
     let mut content_w = 0;
-    for (_, desc) in HELP_KEYS {
+    let mut all_keys: Vec<&(&str, &str)> = HELP_KEYS.iter().collect();
+    if app.multi {
+        all_keys.extend(MULTI_HELP_KEYS.iter());
+    }
+    for (_, desc) in &all_keys {
         content_w = content_w.max(16 + desc.chars().count());
     }
     let w = (content_w as u16 + 2).min(area.width.saturating_sub(4));
-    let h = (HELP_KEYS.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let h = (all_keys.len() as u16 + 2).min(area.height.saturating_sub(4));
     let popup = centered_rect(area, w, h);
 
     frame.render_widget(Clear, popup);
 
-    let lines: Vec<Line> = HELP_KEYS
+    let lines: Vec<Line> = all_keys
         .iter()
         .map(|(key, desc)| help_line(key, desc, tc))
         .collect();
@@ -1700,6 +1729,136 @@ fn truncate(s: &str, max: usize) -> String {
     let keep = max.saturating_sub(dots.chars().count());
     let cut: String = s.chars().take(keep).collect();
     format!("{cut}{dots}")
+}
+
+/// The ALL view: one row per node, aggregating the active device class.
+fn draw_all_view(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
+    let rows = app.all_rows();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
+        .border_style(Style::default().fg(tc.border))
+        .title(format!(" ALL - {} ", app.active_tab.label()))
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    let filter = if app.errors_only {
+        " [errors only] "
+    } else {
+        ""
+    };
+    let header = Line::from(vec![
+        styled(" NODE", tc.muted, true),
+        styled("   TX Gbps", tc.muted, true),
+        styled("   RX Gbps", tc.muted, true),
+        styled("  PORTS", tc.muted, true),
+        styled("  PROCS", tc.muted, true),
+        styled("     ERR/s", tc.muted, true),
+        styled("   CONG/s", tc.muted, true),
+        styled("  STATUS", tc.muted, true),
+        styled(filter, tc.warning, false),
+    ]);
+
+    let mut lines: Vec<Line> = vec![header];
+    for (i, row) in rows.iter().enumerate() {
+        let selected = i == app.all_selected;
+        let (status, status_color) = match row.link {
+            crate::remote::LinkState::Live => {
+                if let Some(secs) = row.stale_secs {
+                    (format!("STALE {secs}s"), tc.warning)
+                } else {
+                    ("LIVE".into(), tc.good)
+                }
+            }
+            crate::remote::LinkState::Connecting => ("CONNECTING".into(), tc.warning),
+            crate::remote::LinkState::Disconnected => ("DISCONNECTED".into(), tc.error),
+        };
+        let dim = row.link == crate::remote::LinkState::Disconnected;
+        let fg = if dim { tc.muted } else { tc.fg };
+        let marker = if selected { "▶" } else { " " };
+        // Errors are loud (red); congestion signals are advisory (yellow).
+        let (err_text, err_color) = if row.err_rate > 0.0 {
+            let abbrev = row.top_error.unwrap_or("");
+            (format!("{:>6.0} {abbrev}", row.err_rate), tc.error)
+        } else {
+            ("     0".to_string(), tc.muted)
+        };
+        let (cong_text, cong_color) = if row.cong_rate > 0.0 {
+            (format!("{:>8.0}", row.cong_rate), tc.warning)
+        } else {
+            ("       -".to_string(), tc.muted)
+        };
+        let line = Line::from(vec![
+            styled(&format!("{marker} {:<18}", row.name), fg, selected),
+            styled(&format!("{:>10.1}", row.tx_gbps), fg, selected),
+            styled(&format!("{:>10.1}", row.rx_gbps), fg, selected),
+            styled(
+                &format!("{:>6}/{:<3}", row.active_ports, row.total_ports),
+                fg,
+                selected,
+            ),
+            styled(&format!("{:>6}", row.procs), fg, selected),
+            styled(&err_text, err_color, selected),
+            styled(&cong_text, cong_color, selected),
+            styled(&format!("  {status}"), status_color, selected),
+        ]);
+        lines.push(line);
+    }
+    if rows.is_empty() {
+        let msg = if app.errors_only {
+            " no unhealthy nodes (e to show all)"
+        } else {
+            " no nodes"
+        };
+        lines.push(Line::from(styled(msg, tc.muted, false)));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Node picker popup (n key), mirroring the column picker interaction.
+fn draw_node_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+    let w = 45.min(area.width.saturating_sub(4));
+    let h = ((app.node_names.len() + 4) as u16).min(area.height.saturating_sub(4));
+    let popup = centered_rect(area, w, h);
+
+    frame.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = app
+        .node_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let cursor = if i == app.node_picker_cursor {
+                "▶"
+            } else {
+                " "
+            };
+            let state = app
+                .node_links
+                .get(i)
+                .copied()
+                .unwrap_or(crate::remote::LinkState::Disconnected);
+            let status = match state {
+                crate::remote::LinkState::Live => "●",
+                crate::remote::LinkState::Connecting => "◐",
+                crate::remote::LinkState::Disconnected => "✗",
+            };
+            let selected = i == app.node_picker_cursor;
+            Line::from(vec![
+                styled(&format!("{cursor} "), tc.accent, false),
+                styled(&format!("{status} {name}"), tc.fg, selected),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(super::glyphs::border())
+        .border_style(Style::default().fg(tc.accent))
+        .title(" Nodes (n/Esc to close) ")
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 #[cfg(test)]

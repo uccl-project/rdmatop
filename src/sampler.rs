@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::{net, nvlink, stat, xgmi};
+use crate::{net, nvlink, stat, sysinfo, xgmi};
 
 /// One subsystem's reading, stamped as its read completes, so rate math
 /// never absorbs another subsystem's latency nor this one's own lazy
@@ -34,6 +34,9 @@ pub struct Snapshot {
     pub nvlink: Option<Sample<Vec<nvlink::NvLinkSnapshot>>>,
     pub xgmi: Option<Sample<Vec<xgmi::XgmiSnapshot>>>,
     pub processes: Option<Vec<stat::ProcessRdmaInfo>>,
+    /// Host-level info (hostname, load, memory, CPU); read here so remote
+    /// viewers see the sampled host, not their own /proc.
+    pub sys: Option<sysinfo::SysInfo>,
     /// Pass start; used for the duplicate guard and trace ts.
     pub taken_at: Instant,
 }
@@ -49,6 +52,7 @@ fn collect() -> Snapshot {
         nvlink: sample(nvlink::read_all_nvlink_stats),
         xgmi: sample(xgmi::read_all_xgmi_stats),
         processes,
+        sys: Some(sysinfo::read_sysinfo(Default::default())),
         taken_at,
     }
 }
@@ -67,6 +71,11 @@ struct Shared {
 
 pub struct Sampler {
     shared: Arc<Shared>,
+    /// Only the handle that owns the sampling thread stops it on drop;
+    /// cloned observer handles (agent connection threads) must not -- a
+    /// viewer disconnecting dropped its handle and killed the sampler for
+    /// every future viewer.
+    owns_thread: bool,
 }
 
 impl Sampler {
@@ -81,7 +90,10 @@ impl Sampler {
         });
         let thread_shared = shared.clone();
         std::thread::spawn(move || run(&thread_shared));
-        Self { shared }
+        Self {
+            shared,
+            owns_thread: true,
+        }
     }
 
     /// Latest snapshot, if a new one arrived since the last call.
@@ -91,6 +103,17 @@ impl Sampler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Another handle to the same sampling thread. Consumers take from a
+    /// single slot, so exactly one handle should call `try_latest`; the
+    /// others (agent connections) only use `set_interval`. Dropping a
+    /// clone never stops the thread -- only the owning handle does.
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            owns_thread: false,
+        }
     }
 
     /// The captured panic message when the thread died; None while alive.
@@ -117,9 +140,13 @@ impl Sampler {
 
 impl Drop for Sampler {
     // The mailbox has no disconnect signal (unlike a channel), so stopping
-    // on drop is what keeps the thread from sampling forever on error paths.
+    // on drop is what keeps the thread from sampling forever on error
+    // paths -- but only the owning handle may do it. A dropped clone (an
+    // agent connection ending) must not kill the sampler for everyone.
     fn drop(&mut self) {
-        self.stop();
+        if self.owns_thread {
+            self.stop();
+        }
     }
 }
 
@@ -128,7 +155,6 @@ impl Drop for Sampler {
 fn interval_to_ms(interval: Duration) -> u64 {
     (interval.as_millis() as u64).max(1)
 }
-
 /// Render a `catch_unwind` payload (typically &str or String) for the UI.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -166,5 +192,59 @@ fn run(shared: &Shared) {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_clone_does_not_stop_the_sampler() {
+        // Regression: an agent connection thread holds a clone_handle; the
+        // viewer disconnecting dropped it and -- via the shared stop flag --
+        // killed the sampling thread for every future viewer.
+        let sampler = Sampler::spawn(Duration::from_millis(50));
+        // Drain the baseline.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sampler.try_latest().is_none() {
+            assert!(Instant::now() < deadline, "baseline never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A connection comes and goes: clone + drop.
+        {
+            let _conn_handle = sampler.clone_handle();
+        }
+        // The sampler must keep producing. The deadline is generous: a
+        // collect pass can take seconds when subsystem reads time out.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if sampler.try_latest().is_some() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got, "sampler stopped after a clone handle dropped");
+        assert!(sampler.death_reason().is_none());
+        assert!(sampler.death_reason().is_none());
+        sampler.stop();
+    }
+
+    #[test]
+    fn dropping_the_owner_stops_the_sampler() {
+        // The owning handle must still stop the thread on drop (the
+        // original leak-prevention behavior).
+        let sampler = Sampler::spawn(Duration::from_millis(50));
+        let shared_flag = {
+            // Observe via a clone: after the owner drops, the stop flag is set.
+            let probe = sampler.clone_handle();
+            drop(sampler);
+            std::thread::sleep(Duration::from_millis(100));
+            probe
+        };
+        // The thread exits on the flag; nothing panics and no new samples arrive.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(shared_flag.try_latest().is_none());
     }
 }

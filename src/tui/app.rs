@@ -392,6 +392,96 @@ pub struct App {
     pub active_tab: DeviceClass,
     pub seen_tabs: Vec<DeviceClass>,
     tab_selection: HashMap<DeviceClass, usize>,
+    // ---- multi-node state (PR2/PR3/PR4) ----
+    /// True when spawned via --nodes; enables the ALL view and Esc-to-ALL.
+    pub multi: bool,
+    /// ALL view when active; otherwise Node(i) shows nodes[i] in the
+    /// legacy fields below (mirrored from node_states[i]).
+    pub view_all: bool,
+    pub node_names: Vec<String>,
+    pub node_states: Vec<NodeState>,
+    pub active_node: usize,
+    /// Per-node link state for the ALL view (local node is always Live).
+    pub node_links: Vec<crate::remote::LinkState>,
+    /// Cursor in the ALL view table.
+    pub all_selected: usize,
+    /// Node picker popup (n key), mirroring the column picker interaction.
+    pub show_node_picker: bool,
+    pub node_picker_cursor: usize,
+    /// ALL view: hide healthy nodes (any node with errors or stale data).
+    pub errors_only: bool,
+    /// True while apply_snapshot runs as scratch for a non-active node;
+    /// suppresses shared-state side effects (rolling avg, recorder).
+    folding: bool,
+}
+
+/// Per-node snapshot of everything the single-node UI renders. In multi
+/// mode the active node's state is mirrored into the legacy App fields so
+/// ui.rs renders remote nodes through the exact same code path as local.
+pub struct NodeState {
+    pub throughputs: Vec<PortThroughput>,
+    pub processes: Vec<stat::ProcessRdmaInfo>,
+    pub sysinfo: SysInfo,
+    pub history: HashMap<String, DeviceHistory>,
+    pub cpu_history: Vec<f32>,
+    pub has_data: bool,
+    /// Last-applied timestamp for stale marking in the ALL view.
+    pub last_applied_at: Option<Instant>,
+    // ---- per-node baselines (the folded counterpart of the legacy fields) ----
+    // These advance ONLY when this node's own frames fold; sharing one
+    // scratch baseline across nodes made every frame look like the first
+    // (zero rates) and let nodes contaminate each other's deltas.
+    pub prev_stats: Vec<PortStat>,
+    pub prev_ifstats: Vec<IfStats>,
+    pub prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
+    pub prev_xgmi: Vec<crate::xgmi::XgmiSnapshot>,
+    pub prev_stats_at: Option<Instant>,
+    pub prev_ifstats_at: Option<Instant>,
+    pub prev_nvlink_at: Option<Instant>,
+    pub prev_xgmi_at: Option<Instant>,
+    pub prev_taken_at: Option<Instant>,
+    /// Last computed per-class rows. Held (not blanked) when a subsystem
+    /// read fails, mirroring single-node semantics.
+    pub rdma_rows: Vec<PortThroughput>,
+    pub nvlink_rows: Vec<PortThroughput>,
+    pub xgmi_rows: Vec<PortThroughput>,
+    /// Aggregate net rate from this node's ifstats deltas (header Net).
+    pub net_rate: NetRate,
+}
+
+impl NodeState {
+    /// Seconds since the node's last applied snapshot past 3x the refresh
+    /// interval (min 2s); None while fresh.
+    pub fn stale_secs(&self, refresh_interval: Duration) -> Option<u64> {
+        let at = self.last_applied_at?;
+        let threshold = (refresh_interval * 3).max(Duration::from_secs(2));
+        let age = at.elapsed();
+        (age > threshold).then_some(age.as_secs())
+    }
+
+    /// Persist one fold's results, including the advanced baseline.
+    fn store_fold(&mut self, f: FoldResult) {
+        self.throughputs = f.throughputs;
+        self.processes = f.processes;
+        self.sysinfo = f.sysinfo;
+        self.history = f.history;
+        self.cpu_history = f.cpu_history;
+        self.has_data = f.has_data;
+        self.last_applied_at = f.last_applied_at;
+        self.prev_stats = f.prev_stats;
+        self.prev_ifstats = f.prev_ifstats;
+        self.prev_nvlink = f.prev_nvlink;
+        self.prev_xgmi = f.prev_xgmi;
+        self.prev_stats_at = f.prev_stats_at;
+        self.prev_ifstats_at = f.prev_ifstats_at;
+        self.prev_nvlink_at = f.prev_nvlink_at;
+        self.prev_xgmi_at = f.prev_xgmi_at;
+        self.prev_taken_at = f.prev_taken_at;
+        self.rdma_rows = f.rdma_rows;
+        self.nvlink_rows = f.nvlink_rows;
+        self.xgmi_rows = f.xgmi_rows;
+        self.net_rate = f.net_rate;
+    }
 }
 
 const HISTORY_LEN: usize = 60;
@@ -429,17 +519,7 @@ impl DeviceHistory {
     }
 }
 
-#[derive(Clone)]
-pub struct SysInfo {
-    pub hostname: String,
-    pub uptime: String,
-    pub load_avg: String,
-    pub mem_total_mb: u64,
-    pub mem_used_mb: u64,
-    pub mem_pct: f32,
-    pub cpu_pct: f32,
-    pub net: NetRate,
-}
+pub use crate::sysinfo::SysInfo;
 
 impl Default for App {
     fn default() -> Self {
@@ -495,7 +575,368 @@ impl App {
             active_tab: DeviceClass::Rdma,
             seen_tabs: vec![DeviceClass::Rdma],
             tab_selection: HashMap::new(),
+            multi: false,
+            view_all: false,
+            node_names: vec!["local".into()],
+            node_states: vec![NodeState {
+                throughputs: Vec::new(),
+                processes: Vec::new(),
+                sysinfo: read_sysinfo(NetRate::default()),
+                history: HashMap::new(),
+                cpu_history: Vec::with_capacity(HISTORY_LEN),
+                has_data: false,
+                last_applied_at: None,
+                prev_stats: Vec::new(),
+                prev_ifstats: Vec::new(),
+                prev_nvlink: Vec::new(),
+                prev_xgmi: Vec::new(),
+                prev_stats_at: None,
+                prev_ifstats_at: None,
+                prev_nvlink_at: None,
+                prev_xgmi_at: None,
+                prev_taken_at: None,
+                rdma_rows: Vec::new(),
+                nvlink_rows: Vec::new(),
+                xgmi_rows: Vec::new(),
+                net_rate: NetRate::default(),
+            }],
+            active_node: 0,
+            node_links: vec![crate::remote::LinkState::Live],
+            all_selected: 0,
+            show_node_picker: false,
+            node_picker_cursor: 0,
+            errors_only: false,
+            folding: false,
         }
+    }
+
+    /// Multi-node App: starts on the ALL view with one local node; the
+    /// NodeManager registers remote nodes as they connect.
+    pub fn new_multi() -> Self {
+        let mut app = Self::new();
+        app.multi = true;
+        app.view_all = true;
+        app
+    }
+
+    /// Register a node (called by run_multi before the loop). Keeps the
+    /// local node at index 0.
+    pub fn add_node(&mut self, name: &str) {
+        self.node_names.push(name.to_string());
+        self.node_states.push(NodeState {
+            throughputs: Vec::new(),
+            processes: Vec::new(),
+            sysinfo: SysInfo::default(),
+            history: HashMap::new(),
+            cpu_history: Vec::with_capacity(HISTORY_LEN),
+            has_data: false,
+            last_applied_at: None,
+            prev_stats: Vec::new(),
+            prev_ifstats: Vec::new(),
+            prev_nvlink: Vec::new(),
+            prev_xgmi: Vec::new(),
+            prev_stats_at: None,
+            prev_ifstats_at: None,
+            prev_nvlink_at: None,
+            prev_xgmi_at: None,
+            prev_taken_at: None,
+            rdma_rows: Vec::new(),
+            nvlink_rows: Vec::new(),
+            xgmi_rows: Vec::new(),
+            net_rate: NetRate::default(),
+        });
+        self.node_links.push(crate::remote::LinkState::Connecting);
+    }
+
+    /// Record a node's connection state for the ALL view.
+    pub fn set_node_state(&mut self, idx: usize, state: crate::remote::LinkState) {
+        if let Some(slot) = self.node_links.get_mut(idx) {
+            *slot = state;
+        }
+    }
+
+    /// Fold a snapshot from node `idx` into that node's state; when it is
+    /// the active node (and we are not on the ALL view), also mirror it
+    /// into the legacy fields so ui.rs renders it unchanged.
+    pub fn apply_node_snapshot(&mut self, idx: usize, snap: crate::sampler::Snapshot) {
+        if idx == 0 && !self.multi {
+            // Single-node mode: the original path, byte for byte.
+            self.apply_snapshot(snap);
+            return;
+        }
+        // Multi-node: swap THIS node's baseline into the legacy fields, fold
+        // one snapshot, then write the advanced baseline back. Each node's
+        // baseline is pushed only by its own frames, so rates are correct
+        // and nodes cannot contaminate each other.
+        let Some(baseline) = self.baseline_of(idx) else {
+            return;
+        };
+        self.install_baseline(baseline);
+        self.folding = true;
+        let folded_ok = self.apply_snapshot(snap);
+        self.folding = false;
+        if !folded_ok {
+            // The duplicate guard skipped this frame: the legacy fields hold
+            // the installed baseline and post-harvest empties, NOT fresh
+            // results. Harvesting now would overwrite the node state with
+            // blank sysinfo and empty rows (the blank-header bug).
+            return;
+        }
+        let folded = self.harvest_fold(idx);
+        if let Some(state) = self.node_states.get_mut(idx) {
+            state.store_fold(folded);
+        }
+        // The rolling average tracks the node being viewed; folding
+        // suppressed the push inside apply_snapshot, so push from the
+        // node's stored rows (the display reads node state directly).
+        if self.multi && self.active_node == idx && !self.view_all {
+            if let Some(state) = self.node_states.get(idx) {
+                self.rolling_avg.push(&state.throughputs);
+            }
+        }
+    }
+
+    /// Drop node idx's rate baselines so its next frame re-establishes
+    /// them (zero rates for one tick). Called when the node's connection
+    /// transitions to Live: a fresh handshake means a fresh MonoMap anchor,
+    /// and timestamps mapped with the OLD anchor would poison the elapsed
+    /// math (saturating to 0 => inf rates, or a wrong span).
+    pub fn reset_node_baseline(&mut self, idx: usize) {
+        if let Some(state) = self.node_states.get_mut(idx) {
+            state.prev_stats_at = None;
+            state.prev_ifstats_at = None;
+            state.prev_nvlink_at = None;
+            state.prev_xgmi_at = None;
+            state.prev_taken_at = None;
+        }
+    }
+
+    /// This node's baseline, lifted out of its NodeState for one fold.
+    fn baseline_of(&self, idx: usize) -> Option<NodeBaseline> {
+        let s = self.node_states.get(idx)?;
+        Some(NodeBaseline {
+            prev_stats: s.prev_stats.clone(),
+            prev_ifstats: s.prev_ifstats.clone(),
+            prev_nvlink: s.prev_nvlink.clone(),
+            prev_xgmi: s.prev_xgmi.clone(),
+            prev_stats_at: s.prev_stats_at,
+            prev_ifstats_at: s.prev_ifstats_at,
+            prev_nvlink_at: s.prev_nvlink_at,
+            prev_xgmi_at: s.prev_xgmi_at,
+            prev_taken_at: s.prev_taken_at,
+            rdma_rows: s.rdma_rows.clone(),
+            nvlink_rows: s.nvlink_rows.clone(),
+            xgmi_rows: s.xgmi_rows.clone(),
+            processes: s.processes.clone(),
+            sysinfo: s.sysinfo.clone(),
+            net_rate: s.net_rate.clone(),
+        })
+    }
+
+    /// Swap a node's baseline into the legacy fields so apply_snapshot
+    /// folds against it.
+    fn install_baseline(&mut self, b: NodeBaseline) {
+        self.prev_stats = b.prev_stats;
+        self.prev_ifstats = b.prev_ifstats;
+        self.prev_nvlink = b.prev_nvlink;
+        self.prev_xgmi = b.prev_xgmi;
+        self.prev_stats_at = b.prev_stats_at;
+        self.prev_ifstats_at = b.prev_ifstats_at;
+        self.prev_nvlink_at = b.prev_nvlink_at;
+        self.prev_xgmi_at = b.prev_xgmi_at;
+        self.prev_taken_at = b.prev_taken_at;
+        self.rdma_rows = b.rdma_rows;
+        self.nvlink_rows = b.nvlink_rows;
+        self.xgmi_rows = b.xgmi_rows;
+        self.processes = b.processes;
+        self.sysinfo = b.sysinfo;
+        self.net_rate = b.net_rate;
+    }
+
+    /// Harvest the fold results plus the ADVANCED baseline: apply_snapshot
+    /// has just written both into the legacy fields.
+    fn harvest_fold(&mut self, idx: usize) -> FoldResult {
+        let _ = idx;
+        FoldResult {
+            throughputs: std::mem::take(&mut self.throughputs),
+            processes: std::mem::take(&mut self.processes),
+            sysinfo: std::mem::take(&mut self.sysinfo),
+            history: std::mem::take(&mut self.history),
+            cpu_history: std::mem::take(&mut self.cpu_history),
+            has_data: self.has_data,
+            last_applied_at: self.last_applied_at,
+            prev_stats: std::mem::take(&mut self.prev_stats),
+            prev_ifstats: std::mem::take(&mut self.prev_ifstats),
+            prev_nvlink: std::mem::take(&mut self.prev_nvlink),
+            prev_xgmi: std::mem::take(&mut self.prev_xgmi),
+            prev_stats_at: self.prev_stats_at,
+            prev_ifstats_at: self.prev_ifstats_at,
+            prev_nvlink_at: self.prev_nvlink_at,
+            prev_xgmi_at: self.prev_xgmi_at,
+            prev_taken_at: self.prev_taken_at,
+            rdma_rows: std::mem::take(&mut self.rdma_rows),
+            nvlink_rows: std::mem::take(&mut self.nvlink_rows),
+            xgmi_rows: std::mem::take(&mut self.xgmi_rows),
+            net_rate: self.net_rate.clone(),
+        }
+    }
+
+    /// Header identity for the current view: the active node's name in a
+    /// node view, "ALL" on the aggregate view, empty in single-node mode.
+    pub fn view_label(&self) -> String {
+        if !self.multi {
+            return String::new();
+        }
+        if self.view_all {
+            return "ALL".to_string();
+        }
+        self.node_names
+            .get(self.active_node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drill into the node selected by the ALL-view cursor, resolving
+    /// through the sorted rows so the target is the row the operator sees.
+    pub fn enter_selected_node(&mut self) {
+        let rows = self.all_rows();
+        if let Some(row) = rows.get(self.all_selected) {
+            let idx = row.node_idx;
+            self.enter_node(idx);
+        }
+    }
+
+    /// Drill into node idx from the ALL view.
+    pub fn enter_node(&mut self, idx: usize) {
+        if idx >= self.node_states.len() {
+            return;
+        }
+        self.active_node = idx;
+        self.view_all = false;
+        self.selected_row = 0;
+        self.table_offset = 0;
+        self.h_scroll = 0;
+        self.detail_scroll = 0;
+    }
+
+    /// Return to the ALL view (Esc in a node view).
+    pub fn exit_to_all(&mut self) {
+        self.view_all = true;
+    }
+
+    /// Cycle the node picker cursor.
+    pub fn node_picker_up(&mut self) {
+        self.node_picker_cursor = self.node_picker_cursor.saturating_sub(1);
+    }
+
+    pub fn node_picker_down(&mut self) {
+        if self.node_picker_cursor + 1 < self.node_names.len() {
+            self.node_picker_cursor += 1;
+        }
+    }
+
+    pub fn toggle_node_picker(&mut self) {
+        self.show_node_picker = !self.show_node_picker;
+        if self.show_node_picker {
+            self.node_picker_cursor = self.active_node;
+        }
+    }
+
+    pub fn close_node_picker(&mut self) {
+        self.show_node_picker = false;
+    }
+
+    /// Toggle the ALL view's "unhealthy nodes only" filter.
+    pub fn toggle_errors_only(&mut self) {
+        self.errors_only = !self.errors_only;
+        self.all_selected = 0;
+    }
+
+    /// ALL-view cursor movement.
+    pub fn all_up(&mut self) {
+        self.all_selected = self.all_selected.saturating_sub(1);
+    }
+
+    pub fn all_down(&mut self) {
+        if self.all_selected + 1 < self.node_names.len() {
+            self.all_selected += 1;
+        }
+    }
+
+    /// Aggregate rows for the ALL view: one row per node, summing the
+    /// active device class. Sorted by TX descending.
+    pub fn all_rows(&self) -> Vec<AllRow> {
+        let mut rows = Vec::new();
+        for (idx, state) in self.node_states.iter().enumerate() {
+            let mut tx = 0.0;
+            let mut rx = 0.0;
+            let mut active_ports = 0usize;
+            let mut total_ports = 0usize;
+            let mut err_rate = 0.0;
+            let mut cong_rate = 0.0;
+            // Dominant error: the counter with the highest rate this pass.
+            let mut top: Option<(&'static str, f64)> = None;
+            for t in &state.throughputs {
+                if t.class != self.active_tab {
+                    continue;
+                }
+                tx += t.tx_gbps;
+                rx += t.rx_gbps;
+                total_ports += 1;
+                if t.state.as_deref() != Some("DOWN") {
+                    active_ports += 1;
+                }
+                for cr in &t.counter_rates {
+                    if cr.rate <= 0.0 {
+                        continue;
+                    }
+                    if let Some(abbrev) = counter_abbrev(ERROR_COUNTERS, &cr.name) {
+                        err_rate += cr.rate;
+                        if top.map(|(_, r)| cr.rate > r).unwrap_or(true) {
+                            top = Some((abbrev, cr.rate));
+                        }
+                    } else if counter_abbrev(CONGESTION_COUNTERS, &cr.name).is_some() {
+                        cong_rate += cr.rate;
+                    }
+                }
+            }
+            rows.push(AllRow {
+                node_idx: idx,
+                name: self.node_names.get(idx).cloned().unwrap_or_default(),
+                tx_gbps: tx,
+                rx_gbps: rx,
+                active_ports,
+                total_ports,
+                procs: state.processes.len(),
+                link: self
+                    .node_links
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(crate::remote::LinkState::Disconnected),
+                stale_secs: state.stale_secs(self.refresh_interval),
+                spark: state
+                    .history
+                    .values()
+                    .map(|h| h.tx.iter().sum::<f64>())
+                    .sum(),
+                err_rate,
+                cong_rate,
+                top_error: top.map(|(a, _)| a),
+            });
+        }
+        if self.errors_only {
+            rows.retain(|r| {
+                r.err_rate > 0.0
+                    || r.stale_secs.is_some()
+                    || r.link == crate::remote::LinkState::Disconnected
+            });
+        }
+        rows.sort_by(|a, b| {
+            b.tx_gbps
+                .partial_cmp(&a.tx_gbps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
     }
 
     /// Fold one sampler snapshot into the app state, per subsystem: a failed
@@ -503,10 +944,12 @@ impl App {
     /// broken source never blocks the others. Each subsystem's first success
     /// is its baseline (prev == curr, zero rates); real rates follow. Elapsed
     /// comes from sampler-side timestamps so UI queue latency can't skew rates.
-    pub fn apply_snapshot(&mut self, snap: crate::sampler::Snapshot) {
+    /// Returns false when the duplicate guard skipped the snapshot (the
+    /// caller must not treat the legacy fields as freshly folded then).
+    pub fn apply_snapshot(&mut self, snap: crate::sampler::Snapshot) -> bool {
         if let Some(prev) = self.prev_taken_at {
             if snap.taken_at.duration_since(prev).as_secs_f64() < 0.1 {
-                return;
+                return false;
             }
         }
         // Per-subsystem elapsed: each sample carries its own read-adjacent
@@ -569,23 +1012,67 @@ impl App {
 
         self.clamp_selection();
         self.update_history();
-        self.rolling_avg.push(&self.throughputs);
-        if let Some(rec) = &mut self.recorder {
-            rec.push(snap.taken_at, port_metrics(&self.throughputs));
+        if !self.folding {
+            self.rolling_avg.push(&self.throughputs);
         }
-        self.sysinfo = read_sysinfo(self.net_rate.clone());
+        if let Some(rec) = &mut self.recorder {
+            if !self.folding {
+                // Folding a non-active node: never record into the active
+                // node's trace.
+                let metrics = port_metrics(&self.throughputs);
+                // In multi-node mode, prefix the node name so a shared trace
+                // keeps per-device tracks distinguishable (node1/mlx5_0).
+                let metrics = if self.multi {
+                    let node = self
+                        .node_names
+                        .get(self.active_node)
+                        .cloned()
+                        .unwrap_or_default();
+                    metrics
+                        .into_iter()
+                        .map(|mut m| {
+                            m.dev_name = format!("{}/{}", node, m.dev_name);
+                            m
+                        })
+                        .collect()
+                } else {
+                    metrics
+                };
+                rec.push(snap.taken_at, metrics);
+            }
+        }
+        // Prefer the sampler-reported sysinfo (correct for remote nodes).
+        // When absent: single-node mode reads the local /proc (legacy
+        // behavior); a fold holds the node's installed sysinfo -- reading
+        // the viewer's own /proc would attribute the wrong host to a
+        // remote node.
+        self.sysinfo = match snap.sys {
+            Some(mut sys) => {
+                sys.net = self.net_rate.clone();
+                sys
+            }
+            None if !self.folding => read_sysinfo(self.net_rate.clone()),
+            None => self.sysinfo.clone(),
+        };
         if self.cpu_history.len() >= HISTORY_LEN {
             self.cpu_history.remove(0);
         }
         self.cpu_history.push(self.sysinfo.cpu_pct);
         self.recompute_display();
+        true
     }
 
     /// Seconds since the last applied snapshot when it exceeds a staleness
     /// threshold (3x the refresh interval, min 2s); `None` while fresh.
     /// Lets the UI flag a stalled sampler, which `sampler_error` cannot see.
     pub fn stale_secs(&self) -> Option<u64> {
-        let at = self.last_applied_at?;
+        let at = if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .and_then(|s| s.last_applied_at)?
+        } else {
+            self.last_applied_at?
+        };
         let threshold = (self.refresh_interval * 3).max(Duration::from_secs(2));
         let age = at.elapsed();
         (age > threshold).then_some(age.as_secs())
@@ -807,22 +1294,101 @@ impl App {
 
     /// Returns the throughputs to display: rolling avg if enabled, otherwise instant.
     /// Uses a cached value recomputed once per refresh.
-    pub fn display_throughputs(&self) -> &[PortThroughput] {
-        &self.cached_display
+    /// Rows to render for the active tab, computed from the viewed node's
+    /// stored state (multi) or the cached display (single). All render
+    /// reads go through the view_* accessors so the display can never
+    /// observe another node's fold scratch.
+    pub fn display_throughputs(&self) -> Vec<PortThroughput> {
+        if !self.multi {
+            return self.cached_display.clone();
+        }
+        let Some(state) = self.node_states.get(self.active_node) else {
+            return Vec::new();
+        };
+        state
+            .throughputs
+            .iter()
+            .filter(|t| t.class == self.active_tab)
+            .cloned()
+            .collect()
     }
 
-    pub fn selected_throughput(&self) -> Option<&PortThroughput> {
-        self.cached_display.get(self.selected_row)
+    pub fn selected_throughput(&self) -> Option<PortThroughput> {
+        self.display_throughputs()
+            .into_iter()
+            .nth(self.selected_row)
     }
 
     pub fn selected_device_processes(&self) -> Vec<&stat::ProcessRdmaInfo> {
         let Some(t) = self.selected_throughput() else {
             return Vec::new();
         };
-        self.processes
-            .iter()
-            .filter(|p| p.dev_name == t.dev_name)
-            .collect()
+        let procs: &Vec<stat::ProcessRdmaInfo> = if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| &s.processes)
+                .unwrap_or(&self.processes)
+        } else {
+            &self.processes
+        };
+        procs.iter().filter(|p| p.dev_name == t.dev_name).collect()
+    }
+
+    /// The viewed node's sysinfo (header).
+    pub fn view_sysinfo(&self) -> &SysInfo {
+        if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| &s.sysinfo)
+                .unwrap_or(&self.sysinfo)
+        } else {
+            &self.sysinfo
+        }
+    }
+
+    /// The viewed node's sparkline history.
+    pub fn view_history(&self) -> &HashMap<String, DeviceHistory> {
+        if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| &s.history)
+                .unwrap_or(&self.history)
+        } else {
+            &self.history
+        }
+    }
+
+    pub fn view_cpu_history(&self) -> &[f32] {
+        if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| s.cpu_history.as_slice())
+                .unwrap_or(&self.cpu_history)
+        } else {
+            &self.cpu_history
+        }
+    }
+
+    pub fn view_has_data(&self) -> bool {
+        if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| s.has_data)
+                .unwrap_or(self.has_data)
+        } else {
+            self.has_data
+        }
+    }
+
+    pub fn view_net_rate(&self) -> NetRate {
+        if self.multi {
+            self.node_states
+                .get(self.active_node)
+                .map(|s| s.net_rate.clone())
+                .unwrap_or_else(|| self.net_rate.clone())
+        } else {
+            self.net_rate.clone()
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -860,6 +1426,115 @@ impl App {
     }
 }
 
+/// One ALL-view table row.
+pub struct AllRow {
+    /// Index into node_states; survives the TX sort so Enter drills into
+    /// the row's actual node, not whatever lands under the cursor.
+    pub node_idx: usize,
+    pub name: String,
+    pub tx_gbps: f64,
+    pub rx_gbps: f64,
+    pub active_ports: usize,
+    pub total_ports: usize,
+    pub procs: usize,
+    pub link: crate::remote::LinkState,
+    pub stale_secs: Option<u64>,
+    /// Summed TX history, for a rough activity indicator.
+    pub spark: f64,
+    /// Hard error counters per second (out_of_buffer, RNR, CQE errors, ...).
+    pub err_rate: f64,
+    /// Congestion signals per second (ECN marks, CNPs) -- not errors, but
+    /// worth surfacing next to them.
+    pub cong_rate: f64,
+    /// Abbreviated name of the dominant error counter (e.g. "OB", "RNR");
+    /// None when the node is clean.
+    pub top_error: Option<&'static str>,
+}
+
+/// Hard-error counters: non-zero means the node is dropping or failing
+/// work. Abbreviations keep the ALL view narrow with many nodes.
+const ERROR_COUNTERS: &[(&str, &str)] = &[
+    ("out_of_buffer", "OB"),
+    ("rnr_nak_retry_err", "RNR"),
+    ("req_cqe_error", "CQE"),
+    ("req_cqe_flush_error", "CQEfl"),
+    ("resp_cqe_error", "rCQE"),
+    ("resp_cqe_flush_error", "rCQEfl"),
+    ("local_ack_timeout_err", "ACKTO"),
+    ("out_of_sequence", "OOS"),
+    ("packet_seq_err", "PSEQ"),
+    ("rx_drops", "DROP"),
+    ("retrans_timeout_events", "RETX"),
+    ("unresponsive_remote_events", "UNRSP"),
+    ("impaired_remote_conn_events", "IMPR"),
+    ("rdma_write_wr_err", "WrErr"),
+    ("rdma_read_wr_err", "RdErr"),
+    ("req_remote_invalid_request", "REQinv"),
+];
+
+/// Congestion signals: ECN marks and their CNP feedback. Traffic-level
+/// information, not failures.
+const CONGESTION_COUNTERS: &[(&str, &str)] = &[
+    ("np_ecn_marked_roce_packets", "ECN"),
+    ("np_cnp_sent", "CNPs"),
+    ("rp_cnp_handled", "CNPh"),
+    ("roce_adp_retrans", "ADP"),
+];
+
+fn counter_abbrev(
+    table: &'static [(&'static str, &'static str)],
+    name: &str,
+) -> Option<&'static str> {
+    table.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
+/// A node's pre-fold baseline, swapped into the legacy fields for one
+/// apply_snapshot pass.
+struct NodeBaseline {
+    prev_stats: Vec<PortStat>,
+    prev_ifstats: Vec<IfStats>,
+    prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
+    prev_xgmi: Vec<crate::xgmi::XgmiSnapshot>,
+    prev_stats_at: Option<Instant>,
+    prev_ifstats_at: Option<Instant>,
+    prev_nvlink_at: Option<Instant>,
+    prev_xgmi_at: Option<Instant>,
+    prev_taken_at: Option<Instant>,
+    /// Held display state so a failed read keeps the node's own rows,
+    /// processes, and sysinfo instead of another node's leftovers.
+    rdma_rows: Vec<PortThroughput>,
+    nvlink_rows: Vec<PortThroughput>,
+    xgmi_rows: Vec<PortThroughput>,
+    processes: Vec<stat::ProcessRdmaInfo>,
+    sysinfo: SysInfo,
+    net_rate: NetRate,
+}
+
+/// One fold's output: display state plus the ADVANCED baseline that
+/// apply_snapshot wrote into the legacy fields.
+struct FoldResult {
+    throughputs: Vec<PortThroughput>,
+    processes: Vec<stat::ProcessRdmaInfo>,
+    sysinfo: SysInfo,
+    history: HashMap<String, DeviceHistory>,
+    cpu_history: Vec<f32>,
+    has_data: bool,
+    last_applied_at: Option<Instant>,
+    prev_stats: Vec<PortStat>,
+    prev_ifstats: Vec<IfStats>,
+    prev_nvlink: Vec<crate::nvlink::NvLinkSnapshot>,
+    prev_xgmi: Vec<crate::xgmi::XgmiSnapshot>,
+    prev_stats_at: Option<Instant>,
+    prev_ifstats_at: Option<Instant>,
+    prev_nvlink_at: Option<Instant>,
+    prev_xgmi_at: Option<Instant>,
+    prev_taken_at: Option<Instant>,
+    rdma_rows: Vec<PortThroughput>,
+    nvlink_rows: Vec<PortThroughput>,
+    xgmi_rows: Vec<PortThroughput>,
+    net_rate: NetRate,
+}
+
 /// A class's tab appears the first time it produces rows and stays for the
 /// session, so a transient sampling failure cannot flicker it away.
 fn detect_tabs(seen: &mut Vec<DeviceClass>, rows: &[PortThroughput]) {
@@ -871,101 +1546,8 @@ fn detect_tabs(seen: &mut Vec<DeviceClass>, rows: &[PortThroughput]) {
     }
 }
 
-fn read_file_trimmed(path: &str) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn read_hostname() -> String {
-    let h = read_file_trimmed("/etc/hostname");
-    if h.is_empty() {
-        "unknown".into()
-    } else {
-        h
-    }
-}
-
-fn read_uptime() -> String {
-    let secs: u64 = read_file_trimmed("/proc/uptime")
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0) as u64;
-    format!(
-        "up {} days, {}:{:02}",
-        secs / 86400,
-        (secs % 86400) / 3600,
-        (secs % 3600) / 60
-    )
-}
-
-fn read_load_avg() -> String {
-    read_file_trimmed("/proc/loadavg")
-        .split_whitespace()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn read_meminfo() -> (u64, u64) {
-    let content = read_file_trimmed("/proc/meminfo");
-    let mut total = 0u64;
-    let mut avail = 0u64;
-    for line in content.lines() {
-        let val = || {
-            line.split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
-        };
-        if line.starts_with("MemTotal:") {
-            total = val();
-        }
-        if line.starts_with("MemAvailable:") {
-            avail = val();
-        }
-    }
-    (total / 1024, (total.saturating_sub(avail)) / 1024)
-}
-
-fn read_cpu_usage() -> f32 {
-    let content = read_file_trimmed("/proc/stat");
-    let first = content.lines().next().unwrap_or("");
-    let vals: Vec<u64> = first
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|v| v.parse().ok())
-        .collect();
-    if vals.len() < 4 {
-        return 0.0;
-    }
-    let idle = vals[3];
-    let total: u64 = vals.iter().sum();
-    if total == 0 {
-        return 0.0;
-    }
-    ((total - idle) as f32 / total as f32) * 100.0
-}
-
 fn read_sysinfo(net: NetRate) -> SysInfo {
-    let (mem_total_mb, mem_used_mb) = read_meminfo();
-    let mem_pct = if mem_total_mb > 0 {
-        (mem_used_mb as f32 / mem_total_mb as f32) * 100.0
-    } else {
-        0.0
-    };
-    SysInfo {
-        hostname: read_hostname(),
-        uptime: read_uptime(),
-        load_avg: read_load_avg(),
-        mem_total_mb,
-        mem_used_mb,
-        mem_pct,
-        cpu_pct: read_cpu_usage(),
-        net,
-    }
+    crate::sysinfo::read_sysinfo(net)
 }
 
 /// Map the display throughputs into the recorder's metric shape.
@@ -2359,6 +2941,15 @@ mod apply_snapshot_tests {
         Some(crate::sampler::Sample { data, taken_at })
     }
 
+    fn port_stat_bytes(dev: &str, tx_bytes: u64) -> PortStat {
+        let mut s = PortStat::new(dev.to_string(), 1);
+        s.counters.push(crate::stat::HwCounter {
+            name: "tx_bytes".to_string(),
+            value: tx_bytes,
+        });
+        s
+    }
+
     fn snapshot(stats: Vec<PortStat>, taken_at: Instant) -> Snapshot {
         Snapshot {
             stats: sample(stats, taken_at),
@@ -2366,6 +2957,7 @@ mod apply_snapshot_tests {
             nvlink: sample(Vec::new(), taken_at),
             xgmi: sample(Vec::new(), taken_at),
             processes: Some(Vec::new()),
+            sys: None,
             taken_at,
         }
     }
@@ -2390,6 +2982,7 @@ mod apply_snapshot_tests {
             nvlink: sample(vec![gpu], taken_at),
             xgmi: sample(Vec::new(), taken_at),
             processes: Some(Vec::new()),
+            sys: None,
             taken_at,
         }
     }
@@ -2504,5 +3097,502 @@ mod apply_snapshot_tests {
         let pass_started = Instant::now() - Duration::from_secs(4);
         app.apply_snapshot(snapshot(vec![port_stat("mlx5_0", 0)], pass_started));
         assert_eq!(app.stale_secs(), None);
+    }
+
+    #[test]
+    fn multi_node_rates_are_nonzero_across_frames() {
+        // Regression for the scratch-folding bug: restore_legacy rolled the
+        // per-node baseline back every frame, so every frame looked like the
+        // first (baseline) frame and rates stayed zero forever.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let t0 = Instant::now();
+        // Frame 1 for node 0 (local): establishes the baseline.
+        app.apply_node_snapshot(0, snapshot(vec![port_stat_bytes("mlx5_0", 1_000)], t0));
+        // Frame 2 for node 0 one second later: +1e9 bytes => 8 Gbps.
+        app.apply_node_snapshot(
+            0,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 1_000 + 1_000_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        let rows = &app.node_states[0].throughputs;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            (rows[0].tx_gbps - 8.0).abs() < 1e-9,
+            "local node rate must be 8 Gbps, got {}",
+            rows[0].tx_gbps
+        );
+
+        // Same for a remote node (idx 1): its baseline must be independent.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_1", 5_000)], t0));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_1", 5_000 + 500_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        let rows = &app.node_states[1].throughputs;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            (rows[0].tx_gbps - 4.0).abs() < 1e-9,
+            "remote node rate must be 4 Gbps, got {}",
+            rows[0].tx_gbps
+        );
+        // Cross-node isolation: node 0's baseline must be untouched by node 1.
+        assert_eq!(app.node_states[0].throughputs[0].dev_name, "mlx5_0");
+    }
+
+    #[test]
+    fn multi_node_steady_rates_do_not_jump() {
+        // Steady 10 Gbps traffic through the multi-node fold path: every
+        // frame must produce the same rate. A guard-skip or baseline leak
+        // would make rows vanish or rates oscillate.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let t0 = Instant::now();
+        // 1.25e9 bytes/s = 10 Gbps; frames 1s apart, 6 frames per node.
+        for f in 0..6 {
+            let tx = 1_250_000_000u64 * (f + 1);
+            app.apply_node_snapshot(
+                0,
+                snapshot(
+                    vec![port_stat_bytes("mlx5_0", tx)],
+                    t0 + Duration::from_secs(f),
+                ),
+            );
+            app.apply_node_snapshot(
+                1,
+                snapshot(
+                    vec![port_stat_bytes("mlx5_1", tx / 2)],
+                    t0 + Duration::from_secs(f),
+                ),
+            );
+        }
+        for (idx, want) in [(0, 10.0), (1, 5.0)] {
+            let rows = &app.node_states[idx].throughputs;
+            assert_eq!(rows.len(), 1, "node {idx} rows vanished");
+            let got = rows[0].tx_gbps;
+            assert!((got - want).abs() < 1e-9, "node {idx} rate {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn reconnect_anchor_mismatch_produces_bogus_rates() {
+        // Documents the reconnect bug: after a reconnect the viewer's MonoMap
+        // anchor changes, so the node baseline's prev_taken_at (mapped with the
+        // OLD anchor) no longer lines up with the new frame's mapped time.
+        // The elapsed is then garbage (saturating to 0 => inf rates, or a
+        // wrong span => wrong rates) until the baseline re-establishes.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let a1 = Instant::now();
+        // Connection 1: baseline, then +1e9 bytes over 1s = 8 Gbps.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_0", 1_000)], a1));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 1_000_000_001)],
+                a1 + Duration::from_secs(1),
+            ),
+        );
+        let before = app.node_states[1].throughputs[0].tx_gbps;
+        // Instant addition rounds; allow µs-level slop in the elapsed.
+        assert!((before - 8.0).abs() < 1e-4);
+
+        // Reconnect 10s later: new anchor A2. run_multi resets the node's
+        // baseline on the Live transition, so the next frame re-establishes
+        // (zero rates) instead of dividing by a garbage elapsed.
+        let a2 = a1 + Duration::from_secs(10);
+        app.reset_node_baseline(1);
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 1_000_200_001)],
+                a2 + Duration::from_millis(200),
+            ),
+        );
+        let after = app.node_states[1].throughputs[0].tx_gbps;
+        assert_eq!(
+            after, 0.0,
+            "post-reconnect frame must re-baseline to zero, got {after}"
+        );
+        // The frame after that computes correctly under the new anchor.
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 1_000_200_001 + 250_000_000)],
+                a2 + Duration::from_millis(400),
+            ),
+        );
+        let recovered = app.node_states[1].throughputs[0].tx_gbps;
+        assert!(
+            (recovered - 10.0).abs() < 1e-3,
+            "second post-reconnect frame must be 10 Gbps, got {recovered}"
+        );
+    }
+
+    #[test]
+    fn drill_into_remote_node_shows_remote_data_not_local() {
+        // Reproduces the user's report: Enter on a remote node's row showed
+        // the LOCAL node's numbers. Fold local frames with distinctive
+        // counters, fold remote frames with different counters, drill into
+        // the remote node, and assert the display carries the remote rows.
+        let mut app = App::new_multi();
+        app.add_node("node4");
+        let t0 = Instant::now();
+        // Local (idx 0): mlx5_local with tx=900 on the second frame.
+        app.apply_node_snapshot(0, snapshot(vec![port_stat_bytes("mlx5_local", 100)], t0));
+        app.apply_node_snapshot(
+            0,
+            snapshot(
+                vec![port_stat_bytes("mlx5_local", 100 + 900_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // Remote (idx 1 = "node4"): mlx5_remote with different counters.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_remote", 500)], t0));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_remote", 500 + 100_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // Drill into node4 (ALL-view Enter).
+        app.enter_node(1);
+        // The displayed rows must be the remote node's, not the local's.
+        let display = app.display_throughputs();
+        assert_eq!(
+            display.len(),
+            1,
+            "drill-in must show the remote node's rows"
+        );
+        assert_eq!(
+            display[0].dev_name, "mlx5_remote",
+            "drill-in shows {} (local data leaked!)",
+            display[0].dev_name
+        );
+        // And the header sysinfo must be the remote node's, not blank.
+        assert!(
+            !app.sysinfo.hostname.is_empty() || app.node_states[1].sysinfo.hostname.is_empty(),
+            "sysinfo should come from the folded node state"
+        );
+    }
+
+    #[test]
+    fn enter_uses_sorted_row_identity_not_position() {
+        // The ALL view sorts by TX; the cursor is a position in that sorted
+        // list. Enter must drill into the row's actual node, so a sort order
+        // that differs from the node order cannot send the operator into
+        // the wrong node.
+        let mut app = App::new_multi();
+        app.add_node("remote-a"); // idx 1
+        app.add_node("remote-b"); // idx 2
+        let t0 = Instant::now();
+        // local (idx 0): 1 Gbps. remote-a (idx 1): 5 Gbps. remote-b: 0.
+        app.apply_node_snapshot(0, snapshot(vec![port_stat_bytes("dev_local", 0)], t0));
+        app.apply_node_snapshot(
+            0,
+            snapshot(
+                vec![port_stat_bytes("dev_local", 125_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("dev_a", 0)], t0));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("dev_a", 625_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        app.apply_node_snapshot(2, snapshot(vec![port_stat_bytes("dev_b", 0)], t0));
+        app.apply_node_snapshot(
+            2,
+            snapshot(
+                vec![port_stat_bytes("dev_b", 1_000_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // Sorted by TX: [0]=remote-a(5G), [1]=local(1G), [2]=remote-b(~0).
+        let rows = app.all_rows();
+        assert_eq!(rows[0].name, "remote-a");
+        assert_eq!(rows[0].node_idx, 1);
+        // Cursor on the TOP row (position 0) — visually remote-a.
+        app.all_selected = 0;
+        app.enter_selected_node();
+        assert_eq!(app.active_node, 1, "must enter remote-a, not local");
+        assert_eq!(app.display_throughputs()[0].dev_name, "dev_a");
+        // The header must identify the node.
+        assert_eq!(app.view_label(), "remote-a");
+    }
+
+    #[test]
+    fn guard_skip_does_not_blank_node_state() {
+        // Regression for the blank-header bug: a frame rejected by the
+        // duplicate guard must not overwrite the node's stored state with
+        // post-harvest empties.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let t0 = Instant::now();
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_0", 1_000)], t0));
+        let before = app.node_states[1].throughputs.clone();
+        // A second frame within 0.1s: the guard skips it.
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 999_999)],
+                t0 + Duration::from_millis(50),
+            ),
+        );
+        assert_eq!(
+            app.node_states[1].throughputs.len(),
+            before.len(),
+            "guard skip must not blank the node's rows"
+        );
+    }
+
+    /// A PortStat with arbitrary named counters (for error-rate tests).
+    fn port_stat_counters(dev: &str, counters: &[(&str, u64)]) -> PortStat {
+        let mut s = PortStat::new(dev.to_string(), 1);
+        for (name, value) in counters {
+            s.counters.push(crate::stat::HwCounter {
+                name: (*name).to_string(),
+                value: *value,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn all_rows_surface_error_counters_with_abbreviations() {
+        // Non-zero out_of_buffer / RNR must light up the ALL row with their
+        // abbreviation so a bad node is visible without drilling in.
+        let mut app = App::new_multi();
+        app.add_node("bad");
+        app.add_node("clean");
+        let t0 = Instant::now();
+        // bad: baseline then a pass with error counters increasing.
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_counters(
+                    "mlx5_0",
+                    &[
+                        ("out_of_buffer", 1_000),
+                        ("rnr_nak_retry_err", 10),
+                        ("np_ecn_marked_roce_packets", 500),
+                    ],
+                )],
+                t0,
+            ),
+        );
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_counters(
+                    "mlx5_0",
+                    &[
+                        ("out_of_buffer", 1_000 + 800), // +800 / 1s
+                        ("rnr_nak_retry_err", 10 + 21),
+                        ("np_ecn_marked_roce_packets", 500 + 49),
+                    ],
+                )],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // clean: no error counters at all.
+        app.apply_node_snapshot(2, snapshot(vec![port_stat_counters("mlx5_1", &[])], t0));
+        app.apply_node_snapshot(
+            2,
+            snapshot(
+                vec![port_stat_counters("mlx5_1", &[])],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+
+        let rows = app.all_rows();
+        let bad = rows.iter().find(|r| r.name == "bad").expect("bad row");
+        assert!(
+            (bad.err_rate - 821.0).abs() < 1e-6,
+            "err_rate {}",
+            bad.err_rate
+        );
+        assert!(
+            (bad.cong_rate - 49.0).abs() < 1e-6,
+            "cong_rate {}",
+            bad.cong_rate
+        );
+        assert_eq!(bad.top_error, Some("OB"), "dominant error abbreviation");
+
+        let clean = rows.iter().find(|r| r.name == "clean").expect("clean row");
+        assert_eq!(clean.err_rate, 0.0);
+        assert_eq!(clean.top_error, None);
+
+        // errors_only hides the clean node.
+        app.toggle_errors_only();
+        let filtered = app.all_rows();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "bad");
+    }
+
+    #[test]
+    fn display_reads_active_node_state_not_fold_scratch() {
+        // Scoped-B guarantee: the render accessors read the ACTIVE node's
+        // stored state. Interleaved folds of other nodes (which use the
+        // legacy fields as scratch and empty them via harvest) must never
+        // be observable through the display, even on ticks where the
+        // active node has no new frame.
+        let mut app = App::new_multi();
+        app.add_node("node-a");
+        app.add_node("node-b");
+        let t0 = Instant::now();
+        // Both nodes fold real frames.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_a", 1_000)], t0));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_a", 1_000_000_001)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        app.apply_node_snapshot(2, snapshot(vec![port_stat_bytes("mlx5_b", 5_000)], t0));
+        app.apply_node_snapshot(
+            2,
+            snapshot(
+                vec![port_stat_bytes("mlx5_b", 5_000_500_000)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // Drill into node-a.
+        app.enter_node(1);
+        // Simulate a frame-less tick: node-b folds again (its frame
+        // arrives), node-a's does NOT. The harvest empties the legacy
+        // scratch — the display must still show node-a.
+        app.apply_node_snapshot(
+            2,
+            snapshot(
+                vec![port_stat_bytes("mlx5_b", 5_001_000_000)],
+                t0 + Duration::from_secs(2),
+            ),
+        );
+        let display = app.display_throughputs();
+        assert_eq!(display.len(), 1, "active node's rows vanished");
+        assert_eq!(display[0].dev_name, "mlx5_a");
+        // Process list: node-a's stored list (empty here, but must read
+        // the node state, not the scratch).
+        let _ = app.selected_device_processes();
+        // Header sysinfo must come from node-a's state.
+        let _ = app.view_sysinfo();
+        // Stale clock must read node-a's last_applied_at.
+        assert_eq!(app.stale_secs(), None);
+    }
+
+    #[test]
+    fn failed_read_does_not_leak_another_nodes_rows() {
+        // The drain loop folds nodes interleaved (local, remote A, remote
+        // B, ...). rdma_rows survive in the legacy fields between folds
+        // (harvest does not take them), so a failed-stats fold for node B
+        // harvests whatever rows node A's fold left behind -- B briefly
+        // displays A's devices. This is the flicker-with-wrong-data bug.
+        let mut app = App::new_multi();
+        app.add_node("node-a");
+        app.add_node("node-b");
+        let t0 = Instant::now();
+        // Node A folds real rows.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_a", 1_000)], t0));
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_a", 1_000_000_001)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        // Node B folds a FAILED pass (stats=None) right after A.
+        let failed = crate::sampler::Snapshot {
+            stats: None,
+            ifstats: None,
+            nvlink: None,
+            xgmi: None,
+            processes: None,
+            sys: None,
+            taken_at: t0 + Duration::from_secs(2),
+        };
+        app.apply_node_snapshot(2, failed);
+        // Node B must NOT display node A's devices.
+        let names: Vec<&str> = app.node_states[2]
+            .throughputs
+            .iter()
+            .map(|t| t.dev_name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"mlx5_a"),
+            "node-b leaked node-a's rows: {names:?}"
+        );
+    }
+
+    #[test]
+    fn failed_subsystem_read_holds_previous_rows_in_multi_mode() {
+        // Documents the flicker bug: a snapshot whose stats read failed
+        // (None) must HOLD the node's previous rows in multi-node mode,
+        // exactly like single-node mode. The fold's harvest previously
+        // stored the post-harvest empties instead, making the table and
+        // detail pane vanish for a tick whenever a subsystem read failed.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let t0 = Instant::now();
+        // Frame 1: real rows.
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_0", 1_000)], t0));
+        // Frame 2: real rows again (rates computed).
+        app.apply_node_snapshot(
+            1,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 1_000_000_001)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        assert_eq!(app.node_states[1].throughputs.len(), 1);
+        // Frame 3: the stats read FAILED (None) but the pass still ran.
+        // Build a snapshot with stats=None but a fresh taken_at.
+        let failed = crate::sampler::Snapshot {
+            stats: None,
+            ifstats: None,
+            nvlink: None,
+            xgmi: None,
+            processes: None,
+            sys: None,
+            taken_at: t0 + Duration::from_secs(2),
+        };
+        app.apply_node_snapshot(1, failed);
+        // The node's rows must SURVIVE the failed read (hold semantics).
+        assert_eq!(
+            app.node_states[1].throughputs.len(),
+            1,
+            "failed stats read blanked the node's rows (flicker bug)"
+        );
+    }
+
+    #[test]
+    fn multi_node_duplicate_guard_uses_per_node_timestamp() {
+        // The 0.1s duplicate guard must compare against the SAME node's
+        // previous frame, not a rolled-back scratch value.
+        let mut app = App::new_multi();
+        app.add_node("remote");
+        let t0 = Instant::now();
+        app.apply_node_snapshot(0, snapshot(vec![port_stat_bytes("mlx5_0", 1)], t0));
+        app.apply_node_snapshot(1, snapshot(vec![port_stat_bytes("mlx5_1", 1)], t0));
+        // Node 0's second frame is 1s later: must NOT be dropped as a
+        // duplicate just because node 1's frame arrived in between.
+        app.apply_node_snapshot(
+            0,
+            snapshot(
+                vec![port_stat_bytes("mlx5_0", 2)],
+                t0 + Duration::from_secs(1),
+            ),
+        );
+        assert_eq!(app.node_states[0].throughputs.len(), 1);
     }
 }
